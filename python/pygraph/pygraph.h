@@ -569,7 +569,12 @@ class PyGraph {
                py::object const& max_total_seq_len_q,
                py::object const& max_total_seq_len_kv,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+               // EXPERIMENTAL leakage-safe mode. APPENDED, never inserted: the
+               // existing optional arguments keep their positions for callers
+               // that still pass them positionally.
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v_bf16,
+               bool const prevent_leakage);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
     // dSink_token is an optional output set via set_dsink_token() attribute

@@ -7,6 +7,70 @@ import cudnn
 
 # fmt: off
 
+def compute_ref_prevent_leakage(q_dq, k_dq, v_bf16, attn_scale, *, right_bound=0, bottom_right=False,
+                                left_bound=None, seq_lens_kv=None, sink_token=None, output_type=torch.bfloat16,
+                                v_mx_dq=None, block=32):
+    """HYBRID SEMANTIC REFERENCE for leakage-safe MXFP8 SDPA (fp32, no tiling).
+
+    This is the primary numeric oracle for ``sdpa_mxfp8(prevent_leakage=True)``:
+    it models the SEMANTICS the mode promises, not the kernel's schedule.
+
+        O = sum over FULLY VISIBLE 32-blocks of P @ dequant(V_mxfp8)
+          + the ONE causal-boundary 32-block of P @ V_bf16
+
+    Fully masked future blocks contribute nothing. ``P`` and the scores are the
+    SAME in both legs (scores never involve V, so they cannot leak); only WHICH
+    V a column is multiplied by changes at the boundary.
+
+    Why this is the leakage-safe answer: the boundary block is the only place a
+    visible column shares an E8M0 scale with a masked one, so it is the only
+    place a future value can move a visible one. Everywhere else the block is
+    entirely visible, and a scale computed over columns the query may all attend
+    leaks nothing.
+
+    ``q_dq``/``k_dq``: already-dequantized fp32 Q/K, ``[B, H_q, S_q, D]`` /
+    ``[B, H_kv, S_kv, D]``. ``v_mx_dq``: dequantized MXFP8 V (defaults to
+    ``v_bf16``, i.e. a hypothetical lossless quantization). ``right_bound`` is
+    cuDNN's diagonal_band_right_bound (0 = plain causal).
+    """
+    b, h_q, s_q, _ = q_dq.shape
+    _, h_kv, s_kv, d_v = v_bf16.shape
+    dev = q_dq.device
+    g = h_q // h_kv
+    k_e = k_dq.repeat_interleave(g, dim=1).float()
+    v_hi = v_bf16.repeat_interleave(g, dim=1).float()
+    v_lo = (v_bf16 if v_mx_dq is None else v_mx_dq).repeat_interleave(g, dim=1).float()
+
+    scores = torch.matmul(q_dq.float(), k_e.transpose(-1, -2)) * attn_scale
+    i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
+    j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
+    diag = (s_kv - s_q) if bottom_right else 0
+    limit = i + right_bound + diag
+    masked = j > limit
+    if left_bound is not None:
+        masked = masked | (j < i + diag - left_bound)
+    if seq_lens_kv is not None:
+        slk = torch.as_tensor(seq_lens_kv, device=dev, dtype=torch.long).view(b, 1, 1, 1)
+        masked = masked | (j >= slk)
+    scores = scores.masked_fill(masked, float("-inf"))
+
+    if sink_token is not None:
+        col = sink_token.float().reshape(1, h_q, 1, 1).expand(b, h_q, s_q, 1).to(dev)
+        probs = torch.softmax(torch.cat([scores, col], dim=-1), dim=-1)[..., :s_kv]
+    else:
+        row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
+        probs = torch.where(row_has_kv, torch.softmax(scores, dim=-1), torch.zeros_like(scores))
+    probs = torch.nan_to_num(probs)
+
+    # The boundary block of row i is the one its causal LIMIT falls in -- the
+    # same expression the kernel's mask uses.
+    boundary = (j // block) == (torch.clamp(limit, min=0) // block)
+    o = torch.matmul(torch.where(boundary, torch.zeros_like(probs), probs), v_lo) + torch.matmul(
+        torch.where(boundary, probs, torch.zeros_like(probs)), v_hi
+    )
+    return o.to(output_type).float()
+
+
 def compute_ref(q_fp8, k_fp8, v_fp8, sf_q_ref, sf_k_ref, sf_v_ref, attn_scale, torch_itype=torch.float8_e4m3fn, output_type=torch.bfloat16,
                 left_bound=None, right_bound=None, diag_align=None, sink_token=None, rescale_threshold=4.0):
     """

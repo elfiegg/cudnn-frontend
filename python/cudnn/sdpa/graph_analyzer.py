@@ -218,6 +218,14 @@ class SdpaGraphFacts:
     has_paged_kv: bool = False
     has_alibi: bool = False
     has_unfuse_fma: bool = False
+    # EXPERIMENTAL leakage-safe MXFP8 (sdpa_mxfp8(prevent_leakage=True)). MXFP8
+    # shares one E8M0 scale across 32 S_kv positions, so a FUTURE V position can
+    # move the dequantized value of an earlier one in the same block -- a causal
+    # query then sees a key it is masked from. Set: the causal-boundary 32-block
+    # is computed from BF16 P x the ORIGINAL BF16 V (has_v_bf16 / v_bf16_t) and
+    # zeroed on the MXFP8 path. A FACT, not a verdict -- engines/rows judge.
+    prevent_leakage: bool = False
+    has_v_bf16: bool = False
     has_block_mask: bool = False
     has_rng_dump: bool = False
     is_backward: bool = False  # sdpa_backward() node (NodeType.SDPA_BWD)
@@ -282,6 +290,8 @@ class SdpaGraphFacts:
     sf_k_t: Any = None
     sf_v_t: Any = None
     amax_o_t: Any = None
+    # Original BF16 V (prevent_leakage). Same (B, H_kv, S_kv, D_v) as the MXFP8 V.
+    v_bf16_t: Any = None
     # Per-tensor FP8 scalar descale tensors + Amax_S output.
     descale_q_t: Any = None
     descale_k_t: Any = None
@@ -455,6 +465,26 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         op = "sdpa_mxfp8" if is_mxfp8 else "sdpa_fp8"
         return _invalid(f"{op} requires descale_q / descale_k / descale_v")
 
+    # prevent_leakage / v_bf16 pairing + operand consistency. GRAPH-consistency
+    # only (malformed for every kernel): whether any ENGINE serves the mode is a
+    # Capabilities question (fwd/engines.mismatch), not one for this parser.
+    want_no_leak = bool(rec.get("prevent_leakage"))
+    v_bf16 = rec.get("v_bf16")
+    if want_no_leak or v_bf16 is not None:
+        if not want_no_leak:
+            return _invalid("v_bf16 was supplied without prevent_leakage=True; the tensor would be ignored")
+        if v_bf16 is None:
+            return _invalid("prevent_leakage=True requires the original BF16 V tensor via v_bf16")
+        vb_dim, vb_stride = tuple(v_bf16.get_dim()), tuple(v_bf16.get_stride())
+        if len(vb_dim) != 4:
+            return _invalid(f"v_bf16 must be rank-4 (B, H_kv, S_kv, D_v); got rank {len(vb_dim)}")
+        if vb_dim != v_dim:
+            return _invalid(f"v_bf16 dims {vb_dim} must equal the MXFP8 V dims {tuple(v_dim)}")
+        if v_bf16.get_data_type() != cudnn.data_type.BFLOAT16:
+            return _invalid(f"v_bf16 must be BFLOAT16; got {v_bf16.get_data_type()}")
+        if not dense_layout_ok(vb_dim, vb_stride):
+            return _invalid("v_bf16 must have the head dim innermost-contiguous (stride 1) with non-broadcast, " f"non-overlapping strides; got {vb_stride}")
+
     # Masks: resolve cuDNN's several spellings to (causal, bottom_right, window_left).
     use_causal = bool(rec.get("use_causal_mask", False))
     use_causal_br = bool(rec.get("use_causal_mask_bottom_right", False))
@@ -586,6 +616,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         has_paged_kv=(rec.get("paged_attention_k_table") is not None or rec.get("paged_attention_v_table") is not None),
         has_alibi=bool(rec.get("use_alibi_mask")),
         has_unfuse_fma=bool(rec.get("unfuse_fma")),
+        prevent_leakage=bool(rec.get("prevent_leakage")),
+        has_v_bf16=rec.get("v_bf16") is not None,
         has_block_mask=rec.get("block_mask") is not None,
         has_rng_dump=rec.get("rng_dump") is not None,
         has_score_max=rec.get("score_max") is not None,
@@ -626,6 +658,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         sf_k_t=(dsc_k if is_mxfp8 else None),
         sf_v_t=(dsc_v if is_mxfp8 else None),
         amax_o_t=rec.get("amax_o"),
+        v_bf16_t=rec.get("v_bf16"),
         descale_q_t=(dsc_q if is_fp8 else None),
         descale_k_t=(dsc_k if is_fp8 else None),
         descale_v_t=(dsc_v if is_fp8 else None),
@@ -675,6 +708,10 @@ class SdpaBinding:
     sf_k: Any = None
     sf_v: Any = None
     amax_o: Any = None
+    # Original BF16 V (prevent_leakage): the operand the boundary block is
+    # recomputed against, and the whole point of the mode -- dequantizing the
+    # MXFP8 V instead would only expand values quantization already destroyed.
+    v_bf16: Any = None
     # Per-tensor FP8 scalar descales + Amax_S output.
     descale_q: Any = None
     descale_k: Any = None
@@ -727,6 +764,7 @@ class SdpaBinding:
                 self.sf_k,
                 self.sf_v,
                 self.amax_o,
+                self.v_bf16,
                 self.descale_q,
                 self.descale_k,
                 self.descale_v,

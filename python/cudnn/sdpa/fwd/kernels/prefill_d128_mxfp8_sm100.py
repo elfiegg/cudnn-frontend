@@ -83,6 +83,8 @@ from cudnn.frost.tile_dsl.barrier import (
     # `wait` (free fn) — still used for sched.mb_* + mb_softmax_ldtm (not in Bars).
     wait,
     arrive_on_leader,
+    MBarrier,
+    Producer,
 )
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
@@ -113,6 +115,9 @@ from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, GmemTil
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
     apply_mask_chunk,
+    select_causal_boundary_chunk,
+    select_causal_boundary_phase,
+    causal_boundary_chunk_active,
     MASK_NONE,
     MASK_PADDED,
     MASK_CAUSAL,
@@ -389,6 +394,91 @@ STRIDE_BYTE_OFFSET_PV = 8 * CFG.V_SWZ_BYTES
 NUM_KPHASES_PV = CFG.TILE_N // _MMA_K_FP8
 NUM_KPHASES_PV_PER_CHUNK = NUM_KPHASES_PV // CFG.N_BMM2_CHUNKS
 
+# Leakage-safe boundary path.  It follows the ordinary cga2 BMM2 column
+# ownership: each CTA holds one K=32 x (D_v / CTA_MMA) BF16 V half, and the
+# leader's collective MMA consumes the pair.  One slab per K=32 phase avoids
+# reusing a sidecar while the same diagonal KV tile is still in flight.
+BOUNDARY_K = CFG.MX_BLOCK
+BOUNDARY_V_COLS = CFG.TILE_O // CFG.CTA_MMA
+BOUNDARY_V_ELEMS = BOUNDARY_K * BOUNDARY_V_COLS
+BOUNDARY_V_GRANU = 64
+BOUNDARY_V_TMA_ITERS = BOUNDARY_V_COLS // BOUNDARY_V_GRANU
+# Same descriptor rule as ordinary cga2 V: a 64-column local B half fits in
+# the core matrix and therefore has no leading offset.  cga1's 128 columns
+# need the nonzero leading offset, which is why hardcoding 4096 here was wrong.
+BOUNDARY_V_LEADING = 0 if (BOUNDARY_V_COLS // _CORE_MATRIX_ROWS) <= 8 else BOUNDARY_K * 128
+BOUNDARY_V_STRIDE = 8 * 128
+BOUNDARY_PHASES = CFG.TILE_N // BOUNDARY_K
+# Two complete 32x64 phase sets keep the next diagonal tile from overwriting
+# BF16 V still consumed by the previous collective MMA.
+BOUNDARY_V_SETS = 2
+BOUNDARY_V_STAGES = BOUNDARY_V_SETS * BOUNDARY_PHASES
+BOUNDARY_SLOTS = CFG.TILES_Q * BOUNDARY_PHASES
+
+
+@cute.jit
+def _boundary_chunk_active(q_tile_base, kv_loop, phase_in_tile, causal_diag):
+    """Exact causal-boundary phase test without dynamic division.
+
+    A row's 32-wide boundary block starts at ``k_phase_base`` iff its causal
+    limit lies in that block.  Testing the two closed intervals directly is
+    equivalent to the former floor-divide based chunk calculation, including
+    the clipped-at-zero causal prefix.
+    """
+    offset = (causal_diag if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)) + cutlass.Int32(CFG.WINDOW_RIGHT)
+    first_limit = q_tile_base + offset
+    last_limit = first_limit + cutlass.Int32(CFG.TILE_M - 1)
+    k_phase_base = kv_loop * cutlass.Int32(CFG.TILE_N) + cutlass.Int32(phase_in_tile * BOUNDARY_K)
+    return (
+        (last_limit >= cutlass.Int32(0))
+        & (last_limit >= k_phase_base)
+        & (first_limit <= k_phase_base + cutlass.Int32(BOUNDARY_K - 1))
+    )
+
+
+@cute.jit
+def _remove_causal_boundary_chunk(
+    reg_p, q_abs, kv_col_base, causal_diag, *, N: cutlass.Constexpr[int],
+):
+    """Return the ordinary MXFP8 P stream with this row's BF16 boundary zeroed."""
+    q_caus_lim = q_abs + (causal_diag if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)) + cutlass.Int32(CFG.WINDOW_RIGHT)
+    zero_i32 = cutlass.Int32(0)
+    clamped_lim = cutlass.Int32(
+        arith.select((q_caus_lim >= zero_i32).ir_value(), q_caus_lim.ir_value(), zero_i32.ir_value())
+    )
+    block_start = (clamped_lim // cutlass.Int32(BOUNDARY_K)) * cutlass.Int32(BOUNDARY_K)
+    zero = cutlass.Float32(0.0)
+    elems = []
+    for i in cutlass.range_constexpr(N):
+        kv_abs = kv_col_base + cutlass.Int32(i)
+        is_boundary = (
+            (q_caus_lim >= zero_i32)
+            & (kv_abs >= block_start)
+            & (kv_abs < block_start + cutlass.Int32(BOUNDARY_K))
+        )
+        elems.append(cutlass.Float32(arith.select(is_boundary.ir_value(), zero.ir_value(), reg_p[i].ir_value())))
+    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+
+
+@cute.jit
+def _boundary_pair_chunk_active(q_tile_base, kv_loop, phase_in_tile, causal_diag, cta_in_pair):
+    """Pair-wide coarse ownership for one collective BF16 boundary MMA."""
+    active = _boundary_chunk_active(q_tile_base, kv_loop, phase_in_tile, causal_diag)
+    if cutlass.const_expr(CFG.CTA_MMA == 1):
+        return active
+    peer_delta = (cutlass.Int32(1) - cutlass.Int32(2) * cta_in_pair) * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+    return active | _boundary_chunk_active(q_tile_base + peer_delta, kv_loop, phase_in_tile, causal_diag)
+
+
+@cute.jit
+def _boundary_subtile_kv_active(q_tile_base, kv_loop, causal_diag):
+    """Whether this CTA's Q subtile has any diagonal 32-column P/V phase."""
+    any_active = cutlass.Int32(0)
+    for phase_in_tile in cutlass.range_constexpr(BOUNDARY_PHASES):
+        if _boundary_chunk_active(q_tile_base, kv_loop, phase_in_tile, causal_diag):
+            any_active = cutlass.Int32(1)
+    return any_active > cutlass.Int32(0)
+
 
 # === Kernel ===
 
@@ -398,6 +488,7 @@ def _kernel(
     tma_q_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_k_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_v_desc: cutlass.GridConstant[tmap.TensorMap],
+    tma_v_bf16_desc: Optional[cutlass.GridConstant[tmap.TensorMap]],
     tma_o_desc: cutlass.GridConstant[tmap.TensorMap],
     # SF rides cta_group=CFG.CTA_MMA TMA → bytes route through mb_q/k/v_full like Q/K/V; no peer Q_SF DSMEM forward.
     tma_q_sf_desc: cutlass.GridConstant[tmap.TensorMap],
@@ -427,6 +518,11 @@ def _kernel(
     sQ_raw = cutlass.Array(STORAGE_DTYPE, CFG.TILES_Q * qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sK_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * kBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sV_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    # Kept at the end of the ordinary input slabs.  The safe specialization
+    # gets two four-phase (32 x (128 / CTA_MMA)) BF16 boundary-V sets.  They are only
+    # used by diagonal causal blocks; the flag-off specialization remains one
+    # dead element.
+    sV_bf16_raw = cutlass.Array(cutlass.BFloat16, BOUNDARY_V_STAGES * BOUNDARY_V_ELEMS if CFG.PREVENT_LEAKAGE else 1, alignment=1024, space=cutlass.AddressSpace.smem)
     sO_raw = cutlass.Array(OUT_STORAGE_DTYPE, CFG.TILES_Q * oBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
 
     # SF buffers sized in BYTES (uint8 storage).
@@ -467,6 +563,17 @@ def _kernel(
         tma_loads_per_tile=TMA_VO_ITERS // CFG.CTA_MMA,
         tma_granu_elems=TMA_VO_GRANU_ELEMS,
         tma_subtile_stride_elems=CFG.TILE_N * TMA_VO_GRANU_ELEMS,
+    )
+    sV_bf16 = SmemTile(
+        base=sV_bf16_raw,
+        elems_per_stage=BOUNDARY_V_ELEMS,
+        stages=BOUNDARY_V_STAGES,
+        leading_byte_offset=BOUNDARY_V_LEADING,
+        stride_byte_offset=BOUNDARY_V_STRIDE,
+        layout=2,  # Swz128B: the non-block-scaled BF16 BMM2 B operand.
+        tma_loads_per_tile=BOUNDARY_V_TMA_ITERS,
+        tma_granu_elems=BOUNDARY_V_GRANU,
+        tma_subtile_stride_elems=BOUNDARY_K * BOUNDARY_V_GRANU,
     )
     sO = SmemTile(
         base=sO_raw,
@@ -523,6 +630,37 @@ def _kernel(
     # MMA may reload SF_Q/K into that tile's S_acc scratch (steady-state ping-pong).
     # Leader-waited (P8): both CTAs' softmax arrive_on_leader → init = CTA_MMA.
     mb_softmax_ldtm = cutlass.Array(cutlass.Int64, CFG.TILES_Q, alignment=16, space=cutlass.AddressSpace.smem)
+    # Softmax -> MMA -> softmax hand-off for every exact 32-column MX block.
+    # Under cga2 every softmax lane in BOTH CTAs arrives at the leader-local
+    # ready barrier; the leader releases both local P-empty barriers after its
+    # collective BF16 MMA.  A CTA whose rows do not own this phase still
+    # publishes an all-zero BF16 P tile so that the collective M dimension is
+    # well-defined.
+    mb_boundary_p_ready = MBarrier(
+        cutlass.Array(cutlass.Int64, BOUNDARY_SLOTS, alignment=16, space=cutlass.AddressSpace.smem),
+        stages=BOUNDARY_SLOTS, init_count=CFG.SOFTMAX_LANES * CFG.CTA_MMA, producer=Producer.LEADER,
+    )
+    mb_boundary_p_empty = MBarrier(
+        cutlass.Array(cutlass.Int64, BOUNDARY_SLOTS, alignment=16, space=cutlass.AddressSpace.smem),
+        stages=BOUNDARY_SLOTS, init_count=CFG.ONE_LANE, producer=Producer.THREAD,
+    )
+    mb_boundary_v_full = MBarrier(
+        cutlass.Array(cutlass.Int64, 1, alignment=16, space=cutlass.AddressSpace.smem),
+        stages=1, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD,
+    )
+    # Each TMA-LDG warp waits for its LOCAL TMA transaction, then both arrive
+    # at the matching leader-local barrier.  There is one slot per P phase so
+    # staging all four BF16 V slices never serializes on a reused barrier.
+    mb_boundary_v_pair_ready = MBarrier(
+        cutlass.Array(cutlass.Int64, BOUNDARY_SLOTS, alignment=16, space=cutlass.AddressSpace.smem),
+        stages=BOUNDARY_SLOTS, init_count=CFG.CTA_MMA, producer=Producer.LEADER,
+    )
+    # One local reuse gate per BF16-V set. Consecutive diagonal KV tiles
+    # alternate sets, so a TMA load cannot overwrite an in-flight MMA source.
+    mb_boundary_v_stage_empty = MBarrier(
+        cutlass.Array(cutlass.Int64, BOUNDARY_V_SETS, alignment=16, space=cutlass.AddressSpace.smem),
+        stages=BOUNDARY_V_SETS, init_count=CFG.ONE_LANE, producer=Producer.THREAD,
+    )
 
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
@@ -566,6 +704,14 @@ def _kernel(
             for s in range(CFG.SCHEDULER_STAGES):
                 nvvm.mbarrier_init(sched.mb_scheduler.subview(s), CFG.ONE_LANE)
                 nvvm.mbarrier_init(sched.mb_read_tile_id.subview(s), READ_TILE_ARRIVERS_TOTAL)
+            if cutlass.const_expr(CFG.PREVENT_LEAKAGE):
+                for bp in cutlass.range_constexpr(BOUNDARY_SLOTS):
+                    mb_boundary_p_ready[bp].init()
+                    mb_boundary_p_empty[bp].init()
+                    mb_boundary_v_pair_ready[bp].init()
+                mb_boundary_v_full.init()
+                for bv in cutlass.range_constexpr(BOUNDARY_V_SETS):
+                    mb_boundary_v_stage_empty[bv].init()
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 # Leader-waited (P8): each softmax warp elect-arrives after its own
                 # S_acc LDTM+wait → SOFTMAX_WG_WARPS arrives per CTA × CTA_MMA CTAs.
@@ -609,6 +755,8 @@ def _kernel(
             bars=bars,
             sched=sched,
             mb_softmax_ldtm=mb_softmax_ldtm,
+            mb_boundary_p_ready=mb_boundary_p_ready,
+            mb_boundary_p_empty=mb_boundary_p_empty,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
@@ -630,6 +778,8 @@ def _kernel(
             bars=bars,
             sched=sched,
             mb_softmax_ldtm=mb_softmax_ldtm,
+            mb_boundary_p_ready=mb_boundary_p_ready,
+            mb_boundary_p_empty=mb_boundary_p_empty,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             n_q_supers=n_q_supers,
             n_qh=n_qh,
@@ -676,6 +826,11 @@ def _kernel(
                     sK_SF=sK_SF,
                     sP_SF=sP_SF,
                     sV_SF=sV_SF,
+                    sV_bf16=sV_bf16,
+                    mb_boundary_p_ready=mb_boundary_p_ready,
+                    mb_boundary_p_empty=mb_boundary_p_empty,
+                    mb_boundary_v_pair_ready=mb_boundary_v_pair_ready,
+                    mb_boundary_v_stage_empty=mb_boundary_v_stage_empty,
                     tmem_ptr_i32=tmem_ptr_i32,
                     bars=bars,
                     sched=sched,
@@ -686,6 +841,7 @@ def _kernel(
                     n_batch=n_batch,
                     mcast_mask=mcast_mask,
                     cta_in_pair=cta_in_pair,
+                    leader_cta_id=leader_cta_id,
                     qh_per_kh=qh_per_kh,
                 )
             else:
@@ -713,6 +869,11 @@ def _kernel(
                 sK_SF=sK_SF,
                 sP_SF=sP_SF,
                 sV_SF=sV_SF,
+                sV_bf16=sV_bf16,
+                mb_boundary_p_ready=mb_boundary_p_ready,
+                mb_boundary_p_empty=mb_boundary_p_empty,
+                mb_boundary_v_pair_ready=mb_boundary_v_pair_ready,
+                mb_boundary_v_stage_empty=mb_boundary_v_stage_empty,
                 tmem_ptr_i32=tmem_ptr_i32,
                 bars=bars,
                 sched=sched,
@@ -723,6 +884,7 @@ def _kernel(
                 n_batch=n_batch,
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
+                leader_cta_id=leader_cta_id,
                 qh_per_kh=qh_per_kh,
             )
 
@@ -731,6 +893,8 @@ def _kernel(
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
+        if cutlass.const_expr(CFG.PREVENT_LEAKAGE):
+            nvvm.prefetch_tensormap(tma_v_bf16_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_q_sf_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_sf_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_sf_desc.get_ptr())
@@ -741,14 +905,19 @@ def _kernel(
             tma_q_sf_desc=tma_q_sf_desc,
             tma_k_sf_desc=tma_k_sf_desc,
             tma_v_sf_desc=tma_v_sf_desc,
+            tma_v_bf16_desc=tma_v_bf16_desc,
             sQ=sQ,
             sK=sK,
             sV=sV,
             sQ_SF=sQ_SF,
             sK_SF=sK_SF,
             sV_SF=sV_SF,
+            sV_bf16=sV_bf16,
             bars=bars,
             sched=sched,
+            mb_boundary_v_full=mb_boundary_v_full,
+            mb_boundary_v_pair_ready=mb_boundary_v_pair_ready,
+            mb_boundary_v_stage_empty=mb_boundary_v_stage_empty,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
@@ -759,6 +928,7 @@ def _kernel(
             qh_per_kh=qh_per_kh,
             is_leader=is_leader,
             cta_in_pair=cta_in_pair,
+            leader_cta_id=leader_cta_id,
             tma_mcast_mask=tma_mcast_mask,
             sf_mcast_mask=sf_mcast_mask,
         )
@@ -797,14 +967,19 @@ def _tmaldg_warp_group(
     tma_q_sf_desc,
     tma_k_sf_desc,
     tma_v_sf_desc,
+    tma_v_bf16_desc,
     sQ,
     sK,
     sV,
     sQ_SF,
     sK_SF,
     sV_SF,
+    sV_bf16,
     bars,
     sched,
+    mb_boundary_v_full,
+    mb_boundary_v_pair_ready,
+    mb_boundary_v_stage_empty,
     seqlen_q,
     seqlen_kv,
     seq_kv_lens_tensor,
@@ -815,6 +990,7 @@ def _tmaldg_warp_group(
     qh_per_kh,
     is_leader,
     cta_in_pair,
+    leader_cta_id,
     tma_mcast_mask,
     sf_mcast_mask,
 ):
@@ -848,6 +1024,9 @@ def _tmaldg_warp_group(
     else:
         tma_k = GmemTileTma(tma_k_desc)
         tma_v = GmemTileTma(tma_v_desc)
+    # prevent_leakage rejects THD, so this compact original-BF16 V map is
+    # always the dense descriptor passed at launch.
+    tma_v_bf16 = GmemTileTma(tma_v_bf16_desc) if cutlass.const_expr(CFG.PREVENT_LEAKAGE) else None
     tma_q_sf = GmemTileTma(tma_q_sf_desc)
     tma_k_sf = GmemTileTma(tma_k_sf_desc)
     tma_v_sf = GmemTileTma(tma_v_sf_desc)
@@ -905,6 +1084,12 @@ def _tmaldg_warp_group(
     Q_SF_EXPECT_BYTES = SF_SMEM_SIZE_Q * CFG.CTA_MMA
     K_SF_EXPECT_BYTES = SF_SMEM_SIZE_K * CFG.CTA_MMA
     V_SF_EXPECT_BYTES = SF_SMEM_SIZE_V * CFG.CTA_MMA
+
+    # Consecutive diagonal KV tiles alternate between two complete four-phase
+    # sidecar sets. Each set keeps its own reuse parity.
+    boundary_v_full_phase = cutlass.Int32(0)
+    boundary_v_stage_empty_phase_0 = cutlass.Int32(1)
+    boundary_v_stage_empty_phase_1 = cutlass.Int32(1)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -1009,6 +1194,13 @@ def _tmaldg_warp_group(
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=sf_mcast_mask,
             )
+            boundary_v_full_phase, boundary_v_stage_empty_phase_0, boundary_v_stage_empty_phase_1 = _stage_boundary_v_phases(
+                kv_left, q_super_idx, head_idx, batch_idx, kv_head_idx,
+                eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                V_COL_OFFSET_PEER, sV_bf16, tma_v_bf16,
+                mb_boundary_v_full, mb_boundary_v_pair_ready, mb_boundary_v_stage_empty,
+                boundary_v_full_phase, boundary_v_stage_empty_phase_0, boundary_v_stage_empty_phase_1,
+            )
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
             for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1):
@@ -1059,6 +1251,13 @@ def _tmaldg_warp_group(
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=sf_mcast_mask,
                 )
+                boundary_v_full_phase, boundary_v_stage_empty_phase_0, boundary_v_stage_empty_phase_1 = _stage_boundary_v_phases(
+                    kv_loop, q_super_idx, head_idx, batch_idx, kv_head_idx,
+                    eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    V_COL_OFFSET_PEER, sV_bf16, tma_v_bf16,
+                    mb_boundary_v_full, mb_boundary_v_pair_ready, mb_boundary_v_stage_empty,
+                    boundary_v_full_phase, boundary_v_stage_empty_phase_0, boundary_v_stage_empty_phase_1,
+                )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
@@ -1104,6 +1303,98 @@ def _tmaldg_warp_group(
             bars.mb_v_empty[kv_state.idx].wait(kv_state.phase)
             kv_state = advance(kv_state, CFG.STAGES_KV)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+@cute.jit
+def _boundary_pair_kv_active(q_super_idx, kv_loop, eff_seqlen_kv, eff_seqlen_q, cta_in_pair):
+    """Whether any collective P slot needs a BF16 V phase for this KV tile."""
+    if cutlass.const_expr(CFG.PREVENT_LEAKAGE):
+        boundary_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+        any_active = cutlass.Int32(0)
+        for task in cutlass.range(0, BOUNDARY_SLOTS, 1, unroll=1):
+            sub_tile = task // cutlass.Int32(BOUNDARY_PHASES)
+            phase_in_tile = task % cutlass.Int32(BOUNDARY_PHASES)
+            q_tile_base = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + sub_tile * cutlass.Int32(CFG.TILE_M)
+            if _boundary_pair_chunk_active(q_tile_base, kv_loop, phase_in_tile, boundary_diag, cta_in_pair):
+                any_active = cutlass.Int32(1)
+        return any_active > cutlass.Int32(0)
+    return cutlass.Boolean(False)
+
+
+@cute.jit
+def _stage_boundary_v_phases(
+    kv_loop, q_super_idx, head_idx, batch_idx, kv_head_idx,
+    eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+    v_col_offset_peer, sV_bf16, tma_v_bf16,
+    mb_boundary_v_full, mb_boundary_v_pair_ready, mb_boundary_v_stage_empty,
+    full_phase, stage_empty_phase_0, stage_empty_phase_1,
+):
+    """Stage live BF16 V phases into a parity-selected sidecar set.
+
+    A set is never reused until its own BMM2 commit released it. The two sets
+    let TMA prepare the next diagonal KV tile without racing the preceding
+    collective BF16 MMA.
+    """
+    if cutlass.const_expr(CFG.PREVENT_LEAKAGE):
+        if _boundary_pair_kv_active(q_super_idx, kv_loop, eff_seqlen_kv, eff_seqlen_q, cta_in_pair):
+            sidecar_set = kv_loop & cutlass.Int32(1)
+            set_phase = cutlass.Int32(arith.select(
+                (sidecar_set == cutlass.Int32(0)).ir_value(),
+                stage_empty_phase_0.ir_value(),
+                stage_empty_phase_1.ir_value(),
+            ))
+            mb_boundary_v_stage_empty[sidecar_set].wait(set_phase)
+            next_set_phase = set_phase ^ cutlass.Int32(1)
+            stage_empty_phase_0 = cutlass.Int32(arith.select(
+                (sidecar_set == cutlass.Int32(0)).ir_value(),
+                next_set_phase.ir_value(),
+                stage_empty_phase_0.ir_value(),
+            ))
+            stage_empty_phase_1 = cutlass.Int32(arith.select(
+                (sidecar_set == cutlass.Int32(1)).ir_value(),
+                next_set_phase.ir_value(),
+                stage_empty_phase_1.ir_value(),
+            ))
+            boundary_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+            for task in cutlass.range(0, BOUNDARY_SLOTS, 1, unroll=1):
+                sub_tile = task // cutlass.Int32(BOUNDARY_PHASES)
+                phase_in_tile = task % cutlass.Int32(BOUNDARY_PHASES)
+                q_tile_base = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + sub_tile * cutlass.Int32(CFG.TILE_M)
+                active = _boundary_pair_chunk_active(q_tile_base, kv_loop, phase_in_tile, boundary_diag, cta_in_pair)
+                if active:
+                    if nvvm.elect_sync():
+                        mb_boundary_v_full.arrive(n_bytes=BOUNDARY_V_ELEMS * 2)
+                    tma_load_tile(
+                        sV_bf16[sidecar_set * cutlass.Int32(BOUNDARY_PHASES) + phase_in_tile],
+                        tma_v_bf16(
+                            v_col_offset_peer,
+                            kv_head_idx,
+                            kv_loop * cutlass.Int32(CFG.TILE_N) + phase_in_tile * cutlass.Int32(BOUNDARY_K),
+                            batch_idx,
+                        ),
+                        mb_boundary_v_full.smem_ptr,
+                        cta_group=1,
+                    )
+                    mb_boundary_v_full.wait(full_phase)
+                    full_phase = full_phase ^ cutlass.Int32(1)
+                    if nvvm.elect_sync():
+                        mb_boundary_v_pair_ready[task].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    return full_phase, stage_empty_phase_0, stage_empty_phase_1
+
+
+@cute.jit
+def _release_boundary_v_sidecars(
+    kv_loop, q_super_idx, eff_seqlen_kv, eff_seqlen_q,
+    cta_in_pair, leader_cta_id, mb_boundary_v_stage_empty,
+):
+    """Release all four local V sidecars after the collective BF16 BMM."""
+    if cutlass.const_expr(CFG.PREVENT_LEAKAGE):
+        if _boundary_pair_kv_active(q_super_idx, kv_loop, eff_seqlen_kv, eff_seqlen_q, cta_in_pair):
+            if nvvm.elect_sync():
+                sidecar_set = kv_loop & cutlass.Int32(1)
+                mb_boundary_v_stage_empty[sidecar_set].arrive()
+                if cutlass.const_expr(CFG.CTA_MMA == 2):
+                    mb_boundary_v_stage_empty[sidecar_set].arrive_on_peer(leader_cta_id + cutlass.Int32(1))
 
 
 @cute.jit
@@ -1250,6 +1541,11 @@ def _mma_warp_group(
     sK_SF,
     sP_SF,
     sV_SF,
+    sV_bf16,
+    mb_boundary_p_ready,
+    mb_boundary_p_empty,
+    mb_boundary_v_pair_ready,
+    mb_boundary_v_stage_empty,
     tmem_ptr_i32,
     bars,
     sched,
@@ -1260,6 +1556,7 @@ def _mma_warp_group(
     n_batch,
     mcast_mask,
     cta_in_pair,
+    leader_cta_id,
 ):
     """Leader MMA warp — block-scale MMA stream for BMM1 + BMM2.
 
@@ -1322,6 +1619,30 @@ def _mma_warp_group(
         scale_vec_size=SCALE_VEC_SIZE,
     )
 
+    # Boundary P and V are true BF16 operands.  Match the ordinary cga2 BMM2:
+    # M is the two-CTA collective row extent and each CTA supplies 64 V columns.
+    idesc_pv_bf16 = prims.Tcgen05InstrDesc.build(
+        c_dtype=cutlass.Float32,
+        a_dtype=cutlass.BFloat16,
+        b_dtype=cutlass.BFloat16,
+        n_dim=CFG.TILE_O,
+        m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        b_major=1,
+    )
+    bmm2_boundary_desc = MmaDesc(
+        M=CFG.TILE_M * CFG.CTA_MMA,
+        N=CFG.TILE_O,
+        K=BOUNDARY_K,
+        bpe_a=2,
+        bpe_b=2,
+        tile_k_hw=16,
+        btranspose=True,
+        k_subtile=BOUNDARY_K,
+        cta_group=CFG.CTA_MMA,
+        idesc=idesc_pv_bf16,
+        kind=nvvm.Tcgen05MMAKind.F16,
+    )
+
     desc_Q0 = sQ[0].desc()
     desc_Q1 = sQ[1].desc()
 
@@ -1374,7 +1695,7 @@ def _mma_warp_group(
         kv_left = cutlass.Int32(0)
         kv_right = seqlen_kv // cutlass.Int32(CFG.TILE_N)
     else:
-        q_super_idx, _hd, batch_idx, split_idx = _decode_initial_split(
+        q_super_idx, head_idx, batch_idx, split_idx = _decode_initial_split(
             sched.bidx_init,
             sched.bidy_init,
             sched.bidz_init,
@@ -1395,10 +1716,64 @@ def _mma_warp_group(
             kv_left = bounds_init.left
             kv_right = bounds_init.right
 
+    # This safe path is dense/causal/split=1 by construction.  The TMA-LDG
+    # warp stages exactly one original-BF16 32 x (D_v / CTA_MMA) V half per
+    # active phase; the leader consumes both halves with this collective MMA.
+    # No reconstructed/dequantized V ever participates.
+    def _boundary_bmm(
+        sub_tile, phase_in_tile, kv_loop, tmem_o, accum, ready_phase, v_pair_phase,
+        q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+        bmm2_boundary_desc, tmem_raw, sV_bf16,
+        mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+    ):
+        if cutlass.const_expr(CFG.PREVENT_LEAKAGE):
+            boundary_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+            q_tile_base = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(sub_tile * CFG.TILE_M)
+            active = _boundary_pair_chunk_active(q_tile_base, kv_loop, phase_in_tile, boundary_diag, cta_in_pair)
+            if active:
+                slot = sub_tile * BOUNDARY_PHASES + phase_in_tile
+                mb_boundary_p_ready[slot].wait(ready_phase)
+                ready_phase = ready_phase ^ cutlass.Int32(1)
+                mb_boundary_v_pair_ready[slot].wait(v_pair_phase)
+                v_pair_phase = v_pair_phase ^ cutlass.Int32(1)
+                sidecar_set = kv_loop & cutlass.Int32(1)
+                desc_v_bf16 = sV_bf16[sidecar_set * cutlass.Int32(BOUNDARY_PHASES) + cutlass.Int32(phase_in_tile)].desc()
+                for local_k in cutlass.range_constexpr(bmm2_boundary_desc.num_k_steps):
+                    mma_ts_step(
+                        bmm2_boundary_desc,
+                        tmem_raw.subview(LAYOUT.P0_OFF if sub_tile == 0 else LAYOUT.P1_OFF),
+                        desc_v_bf16,
+                        tmem_o,
+                        local_k,
+                        accum,
+                    )
+                    accum = cutlass.Boolean(True)
+                if nvvm.elect_sync():
+                    mb_boundary_p_empty[slot].arrive()
+                    if cutlass.const_expr(CFG.CTA_MMA == 2):
+                        mb_boundary_p_empty[slot].arrive_on_peer(leader_cta_id + cutlass.Int32(1))
+        return accum, ready_phase, v_pair_phase
+
     q_full_phase = cutlass.Int32(0)
     kv_state = PipelineState.start(phase=0)
     bmm2_ready_phase = cutlass.Int32(0)
     empty_mainloop_phase = cutlass.Int32(0)
+    boundary_ready_phase_00 = cutlass.Int32(0)
+    boundary_ready_phase_01 = cutlass.Int32(0)
+    boundary_ready_phase_02 = cutlass.Int32(0)
+    boundary_ready_phase_03 = cutlass.Int32(0)
+    boundary_ready_phase_10 = cutlass.Int32(0)
+    boundary_ready_phase_11 = cutlass.Int32(0)
+    boundary_ready_phase_12 = cutlass.Int32(0)
+    boundary_ready_phase_13 = cutlass.Int32(0)
+    boundary_v_ready_phase_00 = cutlass.Int32(0)
+    boundary_v_ready_phase_01 = cutlass.Int32(0)
+    boundary_v_ready_phase_02 = cutlass.Int32(0)
+    boundary_v_ready_phase_03 = cutlass.Int32(0)
+    boundary_v_ready_phase_10 = cutlass.Int32(0)
+    boundary_v_ready_phase_11 = cutlass.Int32(0)
+    boundary_v_ready_phase_12 = cutlass.Int32(0)
+    boundary_v_ready_phase_13 = cutlass.Int32(0)
     # Steady-state BMM1[sub_i] waits mb_softmax_ldtm[1-sub_i] before reloading
     # SF_Q/K into that tile's S_acc scratch (one iter behind softmax).  Per tile
     # softmax fires n_kv arrives on EACH sub-tile's ldtm mbar: [0] is consumed
@@ -1478,12 +1853,41 @@ def _mma_warp_group(
                 desc_V_SF = sV_SF[old_state.idx].desc()
                 is_not_first_bmm2 = cutlass.Boolean(kv_loop != (kv_left + cutlass.Int32(1)))
 
-                # BMM2[sub0] → O_0.  SF_P0/V0 reload into S_acc_0 scratch (32/36);
-                # the bmm2_ready wait already proves softmax[0] read all of S_acc_0.
+                # BMM2[sub0] → O_0.  First consume the only live BF16
+                # boundary phases (K=32 each), then the unchanged MXFP8 P/V
+                # chunks.  The producer cannot overwrite P0 until this handoff.
+                accum_b2 = is_not_first_bmm2
+                accum_b2, boundary_ready_phase_00, boundary_v_ready_phase_00 = _boundary_bmm(
+                    0, 0, kv_loop - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O0_OFF),
+                    accum_b2, boundary_ready_phase_00, boundary_v_ready_phase_00,
+                    q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+                )
+                accum_b2, boundary_ready_phase_01, boundary_v_ready_phase_01 = _boundary_bmm(
+                    0, 1, kv_loop - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O0_OFF),
+                    accum_b2, boundary_ready_phase_01, boundary_v_ready_phase_01,
+                    q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+                )
+                accum_b2, boundary_ready_phase_02, boundary_v_ready_phase_02 = _boundary_bmm(
+                    0, 2, kv_loop - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O0_OFF),
+                    accum_b2, boundary_ready_phase_02, boundary_v_ready_phase_02,
+                    q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+                )
+                accum_b2, boundary_ready_phase_03, boundary_v_ready_phase_03 = _boundary_bmm(
+                    0, 3, kv_loop - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O0_OFF),
+                    accum_b2, boundary_ready_phase_03, boundary_v_ready_phase_03,
+                    q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+                )
                 bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
                 if nvvm.elect_sync():
                     _utccp_bmm2_sf(tmem_SF_P0, tmem_SF_V0, desc_P_SF_0, desc_V_SF)
-                accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                     mma_ts_step(
                         bmm2_desc,
@@ -1526,11 +1930,43 @@ def _mma_warp_group(
                 if nvvm.elect_sync():
                     bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
-                # BMM2[sub1] → O_1.  SF_P1/V1 reload into S_acc_1 scratch (160/164).
+                # BMM2[sub1] → O_1, with the same four exact 32-column
+                # BF16 boundary phases before its unchanged MXFP8 chunks.
+                accum_b2 = is_not_first_bmm2
+                accum_b2, boundary_ready_phase_10, boundary_v_ready_phase_10 = _boundary_bmm(
+                    1, 0, kv_loop - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O1_OFF),
+                    accum_b2, boundary_ready_phase_10, boundary_v_ready_phase_10,
+                    q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+                )
+                accum_b2, boundary_ready_phase_11, boundary_v_ready_phase_11 = _boundary_bmm(
+                    1, 1, kv_loop - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O1_OFF),
+                    accum_b2, boundary_ready_phase_11, boundary_v_ready_phase_11,
+                    q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+                )
+                accum_b2, boundary_ready_phase_12, boundary_v_ready_phase_12 = _boundary_bmm(
+                    1, 2, kv_loop - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O1_OFF),
+                    accum_b2, boundary_ready_phase_12, boundary_v_ready_phase_12,
+                    q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+                )
+                accum_b2, boundary_ready_phase_13, boundary_v_ready_phase_13 = _boundary_bmm(
+                    1, 3, kv_loop - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O1_OFF),
+                    accum_b2, boundary_ready_phase_13, boundary_v_ready_phase_13,
+                    q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+                )
+                # The BF16 sidecar is still an MMA source until the BMM2
+                # commit below.  Releasing it here lets TMA overwrite it for
+                # the next diagonal KV tile while the issued BF16 MMA is live.
                 bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
                 if nvvm.elect_sync():
                     _utccp_bmm2_sf(tmem_SF_P1, tmem_SF_V1, desc_P_SF_0, desc_V_SF)
-                accum_b2 = is_not_first_bmm2
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                     mma_ts_step(
                         bmm2_desc,
@@ -1558,6 +1994,10 @@ def _mma_warp_group(
                 if nvvm.elect_sync():
                     bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                     bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
+                _release_boundary_v_sidecars(
+                    kv_loop - cutlass.Int32(1), q_super_idx, eff_seqlen_kv, eff_seqlen_q,
+                    cta_in_pair, leader_cta_id, mb_boundary_v_stage_empty,
+                )
 
                 # BMM1[sub1] next-kv → S_acc_1.  SF_Q1/K1 ping-pong into S_acc_0
                 # scratch (8/12); wait tile0's softmax LDTM (SAME-iter — BMM1[sub0]
@@ -1583,11 +2023,39 @@ def _mma_warp_group(
             desc_V_SF = sV_SF[kv_state.idx].desc()
             is_not_first_bmm2_epi = cutlass.Boolean((kv_right - kv_left) != cutlass.Int32(1))
 
-            # Epilogue BMM2[sub0] → O_0.  SF_P0/V0 reload into S_acc_0 scratch.
+            # Epilogue BMM2[sub0] for the final KV tile.
+            accum_b2 = is_not_first_bmm2_epi
+            accum_b2, boundary_ready_phase_00, boundary_v_ready_phase_00 = _boundary_bmm(
+                0, 0, kv_right - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O0_OFF),
+                accum_b2, boundary_ready_phase_00, boundary_v_ready_phase_00,
+                q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+            )
+            accum_b2, boundary_ready_phase_01, boundary_v_ready_phase_01 = _boundary_bmm(
+                0, 1, kv_right - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O0_OFF),
+                accum_b2, boundary_ready_phase_01, boundary_v_ready_phase_01,
+                q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+            )
+            accum_b2, boundary_ready_phase_02, boundary_v_ready_phase_02 = _boundary_bmm(
+                0, 2, kv_right - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O0_OFF),
+                accum_b2, boundary_ready_phase_02, boundary_v_ready_phase_02,
+                q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+            )
+            accum_b2, boundary_ready_phase_03, boundary_v_ready_phase_03 = _boundary_bmm(
+                0, 3, kv_right - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O0_OFF),
+                accum_b2, boundary_ready_phase_03, boundary_v_ready_phase_03,
+                q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+            )
             bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
             if nvvm.elect_sync():
                 _utccp_bmm2_sf(tmem_SF_P0, tmem_SF_V0, desc_P_SF_0, desc_V_SF)
-            accum_b2 = is_not_first_bmm2_epi
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                 mma_ts_step(
                     bmm2_desc,
@@ -1615,11 +2083,41 @@ def _mma_warp_group(
             if nvvm.elect_sync():
                 bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
-            # Epilogue BMM2[sub1] → O_1.  SF_P1/V1 reload into S_acc_1 scratch.
+            # Epilogue BMM2[sub1] for the final KV tile.
+            accum_b2 = is_not_first_bmm2_epi
+            accum_b2, boundary_ready_phase_10, boundary_v_ready_phase_10 = _boundary_bmm(
+                1, 0, kv_right - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O1_OFF),
+                accum_b2, boundary_ready_phase_10, boundary_v_ready_phase_10,
+                q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+            )
+            accum_b2, boundary_ready_phase_11, boundary_v_ready_phase_11 = _boundary_bmm(
+                1, 1, kv_right - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O1_OFF),
+                accum_b2, boundary_ready_phase_11, boundary_v_ready_phase_11,
+                q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+            )
+            accum_b2, boundary_ready_phase_12, boundary_v_ready_phase_12 = _boundary_bmm(
+                1, 2, kv_right - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O1_OFF),
+                accum_b2, boundary_ready_phase_12, boundary_v_ready_phase_12,
+                q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+            )
+            accum_b2, boundary_ready_phase_13, boundary_v_ready_phase_13 = _boundary_bmm(
+                1, 3, kv_right - cutlass.Int32(1), tmem_raw.subview(LAYOUT.O1_OFF),
+                accum_b2, boundary_ready_phase_13, boundary_v_ready_phase_13,
+                q_super_idx, batch_idx, head_idx, eff_seqlen_kv, eff_seqlen_q, qh_per_kh, cta_in_pair, leader_cta_id,
+                    bmm2_boundary_desc, tmem_raw, sV_bf16,
+                    mb_boundary_p_ready, mb_boundary_p_empty, mb_boundary_v_pair_ready,
+            )
+            # As in steady state, keep the BF16 V slabs live through the
+            # BMM2 commit before the TMA producer may reuse them.
             bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase)
             if nvvm.elect_sync():
                 _utccp_bmm2_sf(tmem_SF_P1, tmem_SF_V1, desc_P_SF_0, desc_V_SF)
-            accum_b2 = is_not_first_bmm2_epi
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                 mma_ts_step(
                     bmm2_desc,
@@ -1647,6 +2145,10 @@ def _mma_warp_group(
             if nvvm.elect_sync():
                 bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                 bars.mb_v_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
+            _release_boundary_v_sidecars(
+                kv_right - cutlass.Int32(1), q_super_idx, eff_seqlen_kv, eff_seqlen_q,
+                cta_in_pair, leader_cta_id, mb_boundary_v_stage_empty,
+            )
 
             # P14 drain — rebalance mb_softmax_ldtm[1].  softmax fires one
             # arrive_on_leader(mb_softmax_ldtm[1]) per kv-iter (= n_kv/tile), but the
@@ -1677,7 +2179,7 @@ def _mma_warp_group(
             nxt_q = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load())
             nxt_hb = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(1))).load())
             nxt_v = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load())
-            q_super_idx, _hd, batch_idx, split_idx = _decode_payload_split(
+            q_super_idx, head_idx, batch_idx, split_idx = _decode_payload_split(
                 nxt_q,
                 nxt_hb,
                 cta_in_pair,
@@ -1711,7 +2213,10 @@ def _softmax_kv_body(
     tmem_ptr_i32,
     bars,
     mb_softmax_ldtm,
+    mb_boundary_p_ready,
+    mb_boundary_p_empty,
     q_abs,
+    q_tile_base,
     eff_seqlen_kv,
     eff_seqlen_q,
     scale_log2,
@@ -1720,6 +2225,11 @@ def _softmax_kv_body(
     bmm1_phase,
     stat_empty_phase,
     leader_cta_id,
+    cta_in_pair,
+    boundary_empty_phase_0,
+    boundary_empty_phase_1,
+    boundary_empty_phase_2,
+    boundary_empty_phase_3,
 ):
     """Per-iter softmax body — returns (total_max, total_sum, bmm1_phase, stat_empty_phase).
 
@@ -1891,13 +2401,85 @@ def _softmax_kv_body(
     reg_S_b = reg_S_b * scale_log2 - (new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE))
     reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
     sum_a_pair = row_reduction_pair_64(reg_P_a)
+    reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
+
+    # Keep the original causal softmax.  On its one diagonal KV tile, the
+    # MXFP8 P stream omits the exact 32-column boundary and the compact BF16
+    # P operands below carry that block to the BF16 P x original-BF16 V MMA.
+    # No full-size boundary vector is materialized: doing so raises register
+    # pressure in every softmax iteration, including non-diagonal KV tiles.
     p_a_fp16 = reg_P_a.to(STORAGE_DTYPE)
+    p_b_fp16 = reg_P_b.to(STORAGE_DTYPE)
+    if cutlass.const_expr(CFG.PREVENT_LEAKAGE):
+        boundary_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
+        kv_tile_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+        if _boundary_subtile_kv_active(q_tile_base, kv_loop, boundary_diag):
+            p_a_fp16 = _remove_causal_boundary_chunk(
+                reg_P_a, q_abs, kv_tile_base, boundary_diag, N=CHUNK,
+            ).to(STORAGE_DTYPE)
+            p_b_fp16 = _remove_causal_boundary_chunk(
+                reg_P_b, q_abs, kv_tile_base + cutlass.Int32(CHUNK), boundary_diag, N=CHUNK,
+            ).to(STORAGE_DTYPE)
+
+        def _publish_boundary_phase(reg_p, phase_in_tile, p_addr, empty_phase):
+            # Pair-wide activation makes both CTA M-slices publish a compact
+            # BF16 P tile for the collective boundary MMA.  The fine selector
+            # below leaves the non-owning slice all zeroes.
+            active = _boundary_pair_chunk_active(q_tile_base, kv_loop, phase_in_tile, boundary_diag, cta_in_pair)
+            if active:
+                p_phase = select_causal_boundary_phase(
+                    reg_p,
+                    q_abs,
+                    kv_tile_base + cutlass.Int32(phase_in_tile * BOUNDARY_K),
+                    bottom_right=CFG.BOTTOM_RIGHT,
+                    causal_diag=boundary_diag,
+                    window_right=CFG.WINDOW_RIGHT,
+                    mx_block=BOUNDARY_K,
+                )
+                nvvm.tcgen05_st(
+                    "32x32b",
+                    nvvm.make_tmem_ptr(p_addr, cutlass.Float32),
+                    p_phase.to(cutlass.BFloat16),
+                )
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                slot = sub_tile_id * BOUNDARY_PHASES + phase_in_tile
+                mb_boundary_p_ready[slot].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+                mb_boundary_p_empty[slot].wait(empty_phase)
+                empty_phase = empty_phase ^ cutlass.Int32(1)
+            return empty_phase
+
+        # Each argument is an already compact 32-value K phase.  They all
+        # reuse P0/P1 TMEM scratch sequentially; the empty barrier makes that
+        # reuse explicit before ordinary MXFP8 P overwrites the same storage.
+        boundary_empty_phase_0 = _publish_boundary_phase(
+            cutlass.Vector.from_elements(tuple(reg_P_a[i] for i in range(BOUNDARY_K)), cutlass.Float32),
+            0,
+            p_addr_a,
+            boundary_empty_phase_0,
+        )
+        boundary_empty_phase_1 = _publish_boundary_phase(
+            cutlass.Vector.from_elements(tuple(reg_P_a[BOUNDARY_K + i] for i in range(BOUNDARY_K)), cutlass.Float32),
+            1,
+            p_addr_a,
+            boundary_empty_phase_1,
+        )
+        boundary_empty_phase_2 = _publish_boundary_phase(
+            cutlass.Vector.from_elements(tuple(reg_P_b[i] for i in range(BOUNDARY_K)), cutlass.Float32),
+            2,
+            p_addr_a,
+            boundary_empty_phase_2,
+        )
+        boundary_empty_phase_3 = _publish_boundary_phase(
+            cutlass.Vector.from_elements(tuple(reg_P_b[BOUNDARY_K + i] for i in range(BOUNDARY_K)), cutlass.Float32),
+            3,
+            p_addr_a,
+            boundary_empty_phase_3,
+        )
+
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-    reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
-    p_b_fp16 = reg_P_b.to(STORAGE_DTYPE)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -1913,7 +2495,16 @@ def _softmax_kv_body(
     bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase)
     stat_empty_phase = stat_empty_phase ^ 1
 
-    return total_max, total_sum, bmm1_phase, stat_empty_phase
+    return (
+        total_max,
+        total_sum,
+        bmm1_phase,
+        stat_empty_phase,
+        boundary_empty_phase_0,
+        boundary_empty_phase_1,
+        boundary_empty_phase_2,
+        boundary_empty_phase_3,
+    )
 
 
 @cute.jit
@@ -1928,6 +2519,8 @@ def _softmax_warp_group(
     bars,
     sched,
     mb_softmax_ldtm,
+    mb_boundary_p_ready,
+    mb_boundary_p_empty,
     seq_kv_lens_tensor,
     n_q_supers,
     n_qh,
@@ -1951,6 +2544,10 @@ def _softmax_warp_group(
     bmm1_phase = cutlass.Int32(0)
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
     epilogue_state = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
+    boundary_empty_phase_0 = cutlass.Int32(0)
+    boundary_empty_phase_1 = cutlass.Int32(0)
+    boundary_empty_phase_2 = cutlass.Int32(0)
+    boundary_empty_phase_3 = cutlass.Int32(0)
 
     # total_sum kept as Vector[Float32,2] so per-iter update lowers to packed FMUL2 + FADD2.
     total_max = NEG_INF
@@ -2004,14 +2601,17 @@ def _softmax_warp_group(
         # MASK_NONE: bounds collapse so masked sub-loops fold out at trace time.
         if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
             for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, boundary_empty_phase_0, boundary_empty_phase_1, boundary_empty_phase_2, boundary_empty_phase_3 = _softmax_kv_body(
                     False,
                     sub_tile_id,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
                     mb_softmax_ldtm,
+                    mb_boundary_p_ready,
+                    mb_boundary_p_empty,
                     q_abs,
+                    q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M),
                     eff_seqlen_kv,
                     eff_seqlen_q,
                     scale_log2,
@@ -2020,17 +2620,25 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    cta_in_pair,
+                    boundary_empty_phase_0,
+                    boundary_empty_phase_1,
+                    boundary_empty_phase_2,
+                    boundary_empty_phase_3,
                 )
         else:
             for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, boundary_empty_phase_0, boundary_empty_phase_1, boundary_empty_phase_2, boundary_empty_phase_3 = _softmax_kv_body(
                     True,
                     sub_tile_id,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
                     mb_softmax_ldtm,
+                    mb_boundary_p_ready,
+                    mb_boundary_p_empty,
                     q_abs,
+                    q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M),
                     eff_seqlen_kv,
                     eff_seqlen_q,
                     scale_log2,
@@ -2039,16 +2647,24 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    cta_in_pair,
+                    boundary_empty_phase_0,
+                    boundary_empty_phase_1,
+                    boundary_empty_phase_2,
+                    boundary_empty_phase_3,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, boundary_empty_phase_0, boundary_empty_phase_1, boundary_empty_phase_2, boundary_empty_phase_3 = _softmax_kv_body(
                     False,
                     sub_tile_id,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
                     mb_softmax_ldtm,
+                    mb_boundary_p_ready,
+                    mb_boundary_p_empty,
                     q_abs,
+                    q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M),
                     eff_seqlen_kv,
                     eff_seqlen_q,
                     scale_log2,
@@ -2057,18 +2673,26 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    cta_in_pair,
+                    boundary_empty_phase_0,
+                    boundary_empty_phase_1,
+                    boundary_empty_phase_2,
+                    boundary_empty_phase_3,
                 )
             if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
                 read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, boundary_empty_phase_0, boundary_empty_phase_1, boundary_empty_phase_2, boundary_empty_phase_3 = _softmax_kv_body(
                     True,
                     sub_tile_id,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
                     mb_softmax_ldtm,
+                    mb_boundary_p_ready,
+                    mb_boundary_p_empty,
                     q_abs,
+                    q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M),
                     eff_seqlen_kv,
                     eff_seqlen_q,
                     scale_log2,
@@ -2077,6 +2701,11 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    cta_in_pair,
+                    boundary_empty_phase_0,
+                    boundary_empty_phase_1,
+                    boundary_empty_phase_2,
+                    boundary_empty_phase_3,
                 )
 
         # Per-tile balance: softmax 1 bootstrap + n_kv end-of-body waits = n_kv+1 = corr fires.
@@ -2420,6 +3049,7 @@ def _host(
     q_tensor: cute.Tensor,
     k_tensor: cute.Tensor,
     v_tensor: cute.Tensor,
+    v_bf16_tensor: Optional[cute.Tensor],
     o_tensor: cute.Tensor,
     sf_q_tensor: cute.Tensor,
     sf_k_tensor: cute.Tensor,
@@ -2460,6 +3090,9 @@ def _host(
     qk_box_q = (1, CFG.TILE_M, 1, TMA_QK_GRANU_ELEMS)
     qk_box_k = (1, CFG.TILE_N // CFG.CTA_MMA, 1, TMA_QK_GRANU_ELEMS)
     vo_box_v = (1, CFG.TILE_N, 1, TMA_VO_GRANU_ELEMS)
+    # The safe path's independent map is deliberately only 32 K rows wide.
+    # It drives one compact original-BF16 V slab per active diagonal phase.
+    bf16_v_box = (1, BOUNDARY_K, 1, BOUNDARY_V_GRANU)
     vo_box_o = (1, CFG.TILE_M, 1, _O_GRANU_ELEMS)
     stride_order = (3, 2, 1, 0)
 
@@ -2493,6 +3126,17 @@ def _host(
         stride_order=stride_order,
         swizzle=_tma_swz(CFG.V_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+    )
+    tma_v_bf16_desc = (
+        tmap.create_tensor_map_tiled_from_view(
+            v_bf16_tensor,
+            box_dims=bf16_v_box,
+            stride_order=stride_order,
+            swizzle=tmap.TensorMapSwizzle.s128b,
+            l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+        )
+        if cutlass.const_expr(CFG.PREVENT_LEAKAGE)
+        else None
     )
     tma_o_desc = tmap.create_tensor_map_tiled_from_view(
         o_tensor,
@@ -2591,6 +3235,7 @@ def _host(
         tma_q_desc,
         tma_k_desc,
         tma_v_desc,
+        tma_v_bf16_desc,
         tma_o_desc,
         tma_q_sf_desc,
         tma_k_sf_desc,
@@ -2681,6 +3326,16 @@ def compile(  # noqa: A001
         (_fake_batch, skv, kh, CFG.TILE_O),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
+    )
+    fake_v_bf16 = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (_fake_batch, skv, kh, CFG.TILE_O),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=16,
+        )
+        if CFG.PREVENT_LEAKAGE
+        else None
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
         OUT_STORAGE_DTYPE,
@@ -2800,6 +3455,7 @@ def compile(  # noqa: A001
         fake_q,
         fake_k,
         fake_v,
+        fake_v_bf16,
         fake_o,
         fake_sf_q,
         fake_sf_k,

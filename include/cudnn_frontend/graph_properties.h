@@ -2021,6 +2021,21 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
 
     bool unfuse_fma = false;  // For SM100: use __fmul_rn + __fadd_rn instead of ffma2 in softmax
 
+    // EXPERIMENTAL (MXFP8 forward, SM100). Off by default.
+    //
+    // MXFP8 quantizes V in 32-position groups along S_kv, the BMM2 contracting
+    // dimension. One shared E8M0 scale per group means a FUTURE position can
+    // change the dequantized value of an EARLIER one in the same group -- so a
+    // causal query can observe a key it is masked from. See
+    // docs/operations/Attention.md.
+    //
+    // When set, the kernel computes the 32-position block crossed by each
+    // query's causal boundary from BF16 probabilities and the ORIGINAL BF16 V
+    // (input_names::V_BF16), and zeroes that block's contribution on the MXFP8
+    // path so it is counted exactly once. Fully visible blocks keep the MXFP8
+    // path unchanged; fully masked blocks contribute nothing.
+    bool prevent_leakage = false;
+
     bool
     has_bias() const {
         return inputs.find(input_names::Bias) != inputs.end() && inputs.at(input_names::Bias) != nullptr;
@@ -2067,6 +2082,10 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         Scale_S,
         Scale_O,
         SINK_TOKEN,
+        // Original (pre-quantization) BF16 V. Required by prevent_leakage; must
+        // not be set otherwise. NOT a dequantization of the MXFP8 V -- that
+        // cannot recover what quantization lost.
+        V_BF16,
     };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { O, Stats, Max, Sum_exp, RNG_DUMP, Amax_S, Amax_O };
@@ -2083,23 +2102,28 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         std::shared_ptr<Tensor_attributes> Amax_O;    ///< FP8 absolute maximum for output tensor
     };
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(SDPA_attributes,
-                                   name,
-                                   inputs,
-                                   outputs,
-                                   generate_stats,
-                                   alibi_mask,
-                                   padding_mask,
-                                   dropout_probability,
-                                   attn_scale_value,
-                                   max_seq_len_kv,
-                                   max_total_seq_len_q,
-                                   max_total_seq_len_kv,
-                                   mma_core_mode,
-                                   left_bound,
-                                   right_bound,
-                                   diagonal_alignment,
-                                   implementation)
+    // Defaulting keeps graphs serialized before an optional SDPA feature
+    // existed readable. In particular, a missing prevent_leakage keeps the
+    // legacy false default rather than failing deserialize.
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(SDPA_attributes,
+                                                name,
+                                                inputs,
+                                                outputs,
+                                                generate_stats,
+                                                alibi_mask,
+                                                padding_mask,
+                                                dropout_probability,
+                                                attn_scale_value,
+                                                max_seq_len_kv,
+                                                max_total_seq_len_q,
+                                                max_total_seq_len_kv,
+                                                mma_core_mode,
+                                                left_bound,
+                                                right_bound,
+                                                diagonal_alignment,
+                                                implementation,
+                                                unfuse_fma,
+                                                prevent_leakage)
 
     SDPA_attributes&
     set_generate_stats(bool const value) {
@@ -2319,6 +2343,26 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     set_unfuse_fma(bool value) {
         unfuse_fma = value;
         return *this;
+    }
+
+    // EXPERIMENTAL. See the prevent_leakage member.
+    SDPA_attributes&
+    set_prevent_leakage(bool value) {
+        prevent_leakage = value;
+        return *this;
+    }
+
+    // Original BF16 V, required when prevent_leakage is set.
+    SDPA_attributes&
+    set_v_bf16(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::V_BF16] = std::move(value);
+        return *this;
+    }
+
+    bool
+    has_v_bf16() const {
+        auto const it = inputs.find(input_names::V_BF16);
+        return it != inputs.end() && it->second != nullptr;
     }
 
     // Implementation is in sdpa_support_surface.h

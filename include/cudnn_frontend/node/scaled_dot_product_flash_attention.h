@@ -433,6 +433,97 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                         << "  Expected d_scale: " << d_scale << ", s_scale: " << s_scale << std::endl;
         }
 
+        CHECK_CUDNN_FRONTEND_ERROR(validate_prevent_leakage());
+
+        return {error_code_t::OK, ""};
+    }
+
+    // EXPERIMENTAL leakage-safe MXFP8 (SDPA_attributes::prevent_leakage).
+    //
+    // Phase 1 serves dense causal MXFP8 forward inference only. Everything
+    // outside that envelope must fail HERE with a precise message rather than
+    // fall through to a backend/engine that would ignore V_BF16 and silently
+    // return the leaky result.
+    error_t
+    validate_prevent_leakage() const {
+        auto const v_bf16_it  = attributes.inputs.find(input_names::V_BF16);
+        bool const has_v_bf16 = (v_bf16_it != attributes.inputs.end() && v_bf16_it->second != nullptr);
+
+        if (attributes.prevent_leakage == false) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                has_v_bf16,
+                error_code_t::INVALID_VALUE,
+                "v_bf16 was supplied without prevent_leakage=True. The tensor would be ignored; set "
+                "prevent_leakage=True or drop v_bf16.");
+            return {error_code_t::OK, ""};
+        }
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            is_mxfp8_scaling() == false,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "prevent_leakage=True currently supports dense causal MXFP8 SDPA with split_kv=1 only; this graph is "
+            "not MXFP8 (block-scale E8M0 + F8_128x4 descales).");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_v_bf16 == false,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "prevent_leakage=True requires the original BF16 V tensor via v_bf16.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.generate_stats.value_or(false),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "prevent_leakage=True is forward-inference-only; generate_stats must be false.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            attributes.has_causal_like_masking() == false,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "prevent_leakage=True currently supports dense causal MXFP8 SDPA with split_kv=1 only; this graph has "
+            "no causal right bound.");
+
+        auto const& v_bf16 = v_bf16_it->second;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(v_bf16->get_data_type() != DataType_t::BFLOAT16,
+                                       error_code_t::INVALID_VALUE,
+                                       "prevent_leakage=True requires v_bf16 to have BFLOAT16 data type.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(v_bf16->get_dim().size() != 4 || v_bf16->get_stride().size() != 4,
+                                       error_code_t::INVALID_VALUE,
+                                       "prevent_leakage=True requires v_bf16 to be rank-4 (B, H_kv, S_kv, D_v).");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            v_bf16->get_stride()[3] != 1,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "prevent_leakage=True requires v_bf16 to have the head dimension innermost (stride[3] == 1).");
+
+        auto const& v_dim      = attributes.inputs.at(input_names::V)->get_dim();
+        auto const& v_bf16_dim = v_bf16->get_dim();
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            v_bf16_dim != v_dim,
+            error_code_t::INVALID_VALUE,
+            "prevent_leakage=True requires v_bf16 to have the same (B, H_kv, S_kv, D_v) dims as the MXFP8 V.");
+
+        int64_t const d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
+        int64_t const d_v  = v_dim[3];
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !((d_qk == 128 && d_v == 128) || (d_qk == 192 && d_v == 128)),
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "prevent_leakage=True currently supports (D_qk,D_v) of (128,128) and (192,128); got (" +
+                std::to_string(d_qk) + "," + std::to_string(d_v) + ").");
+
+        bool const ragged = attributes.inputs.at(input_names::Q)->get_ragged_offset() != nullptr ||
+                            attributes.inputs.at(input_names::K)->get_ragged_offset() != nullptr ||
+                            attributes.inputs.at(input_names::V)->get_ragged_offset() != nullptr;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            ragged,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "prevent_leakage=True currently supports dense causal MXFP8 SDPA with split_kv=1 only; THD/ragged "
+            "layouts are out of scope.");
+
+        // A padding mask puts a SECOND partially-visible 32-block on the row --
+        // the one holding seq_len_kv - 1, whose shared E8M0 scale was computed
+        // over columns past the valid length. Only the CAUSAL boundary block is
+        // handled today, so serving this would be half-safe.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            attributes.padding_mask,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "prevent_leakage=True does not support padding masks yet (the padded KV boundary is a second "
+            "partially-visible block).");
+
         return {error_code_t::OK, ""};
     }
 
@@ -642,6 +733,9 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         j               = attributes;
         j["is_mxfp8"]   = is_mxfp8_scaling();
         j["unfuse_fma"] = attributes.unfuse_fma;
+        // Part of graph identity: a leakage-safe execution must never share a
+        // compiled plan with a legacy one (they are numerically different).
+        j["prevent_leakage"] = attributes.prevent_leakage;
         if (auto const rescale_threshold = get_rescale_threshold_from_env(); rescale_threshold.has_value()) {
             j["rescale_threshold"] = rescale_threshold.value();
         }

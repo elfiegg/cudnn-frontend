@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import cudnn
 import pytest
 import torch
@@ -1399,3 +1401,149 @@ def test_bwd_dsink_fact():
     facts = _facts(g)
     assert facts.has_sink and facts.has_dsink
     assert facts.sink_t is not None and facts.dsink_t is not None
+
+
+# ---------------------------------------------------------------------------
+# EXPERIMENTAL leakage-safe MXFP8 (sdpa_mxfp8(prevent_leakage=True))
+#
+# MXFP8 shares one E8M0 scale across 32 S_kv positions -- the BMM2 contracting
+# dimension -- so a FUTURE V value can move the dequantized value of a visible
+# one in the same block, and a causal query sees a key its mask excludes. These
+# tests cover the ANALYZER's half of the contract: describe the request, and
+# reject only what is malformed for EVERY kernel (the envelope itself is a
+# Capabilities question, exercised below via _eligible).
+# ---------------------------------------------------------------------------
+
+_MX_D = 128
+_MX_SF_DTYPE = cudnn.data_type.FP8_E8M0
+
+
+def _mk_mxfp8_graph(
+    *,
+    prevent_leakage=None,
+    v_bf16="ok",
+    d_qk=_MX_D,
+    d_v=_MX_D,
+    causal=True,
+    generate_stats=False,
+    s_kv=S,
+):
+    """A single-node sdpa_mxfp8 graph in the shape the analyzer parses."""
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.FP8_E4M3,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+
+    def _t(dims, dtype, name):
+        d = dims[3]
+        strides = (dims[2] * dims[1] * d, d, dims[1] * d, 1)
+        return g.tensor(dim=list(dims), stride=list(strides), data_type=dtype, name=name)
+
+    q = _t((B, H, S, d_qk), cudnn.data_type.FP8_E4M3, "q")
+    k = _t((B, H, s_kv, d_qk), cudnn.data_type.FP8_E4M3, "k")
+    v = _t((B, H, s_kv, d_v), cudnn.data_type.FP8_E4M3, "v")
+
+    def _sf(dims, name):
+        return g.tensor(
+            dim=list(dims),
+            stride=[dims[1] * dims[2] * dims[3], dims[2] * dims[3], dims[3], 1],
+            data_type=_MX_SF_DTYPE,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+            name=name,
+        )
+
+    kw = dict(
+        q=q,
+        k=k,
+        v=v,
+        descale_q=_sf((B, H, S, d_qk // 32), "sfq"),
+        descale_k=_sf((B, H, s_kv, d_qk // 32), "sfk"),
+        descale_v=_sf((B, H, s_kv // 32, d_v), "sfv"),
+        generate_stats=generate_stats,
+        use_causal_mask=causal,
+    )
+    if v_bf16 is not None and v_bf16 != "none":
+        vb_dims = (B, H, s_kv, d_v)
+        vb_dtype = cudnn.data_type.HALF if v_bf16 == "wrong_dtype" else cudnn.data_type.BFLOAT16
+        if v_bf16 == "wrong_shape":
+            vb_dims = (B, H, s_kv, d_v // 2)
+        kw["v_bf16"] = _t(vb_dims, vb_dtype, "v_bf16")
+    if prevent_leakage is not None:
+        kw["prevent_leakage"] = prevent_leakage
+
+    o, _stats, amax_o = g.sdpa_mxfp8(**kw)
+    _finish_output(o, [B, H, S, d_v], [S * H * d_v, d_v, H * d_v, 1], cudnn.data_type.BFLOAT16)
+    amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+def test_facts_carry_prevent_leakage():
+    facts = _facts(_mk_mxfp8_graph(prevent_leakage=True))
+    assert facts.prevent_leakage is True
+    assert facts.has_v_bf16 is True
+    assert facts.v_bf16_t is not None
+
+
+def test_facts_default_prevent_leakage_off():
+    facts = _facts(_mk_mxfp8_graph(prevent_leakage=None, v_bf16="none"))
+    assert facts.prevent_leakage is False
+    assert facts.has_v_bf16 is False
+
+
+def test_analyzer_rejects_flag_without_v_bf16():
+    facts = ga.analyze(_mk_mxfp8_graph(prevent_leakage=True, v_bf16="none"))
+    assert facts.invalid and "requires the original BF16 V" in facts.invalid
+
+
+def test_analyzer_rejects_v_bf16_without_flag():
+    facts = ga.analyze(_mk_mxfp8_graph(prevent_leakage=False, v_bf16="ok"))
+    assert facts.invalid and "without prevent_leakage" in facts.invalid
+
+
+def test_analyzer_rejects_v_bf16_wrong_dtype():
+    facts = ga.analyze(_mk_mxfp8_graph(prevent_leakage=True, v_bf16="wrong_dtype"))
+    assert facts.invalid and "BFLOAT16" in facts.invalid
+
+
+def test_analyzer_rejects_v_bf16_shape_mismatch():
+    facts = ga.analyze(_mk_mxfp8_graph(prevent_leakage=True, v_bf16="wrong_shape"))
+    assert facts.invalid and "must equal the MXFP8 V dims" in facts.invalid
+
+
+def test_probe_accepts_prevent_leakage_on_mxfp8_causal():
+    """Only the MXFP8 SM100 row carries the boundary path; no other row may
+    claim a flag-on graph."""
+    assert _eligible(_mk_mxfp8_graph(prevent_leakage=True)) == {engines.engine_name(mxfp8=True)}
+
+
+def test_probe_rejects_prevent_leakage_without_causal():
+    """No causal bound means no boundary block -- there is nothing to fix, and
+    accepting it would advertise a guarantee the kernel is not making."""
+    assert _eligible(_mk_mxfp8_graph(prevent_leakage=True, causal=False)) == set()
+
+
+def test_probe_rejects_prevent_leakage_with_stats():
+    assert _eligible(_mk_mxfp8_graph(prevent_leakage=True, generate_stats=True)) == set()
+
+
+def test_probe_rejects_prevent_leakage_with_split_kv():
+    """A boundary 32-block can straddle two splits, and each split's partial
+    would either both add it or neither."""
+    g = _mk_mxfp8_graph(prevent_leakage=True)
+    knobs = engines.SdpaFwdKnobs(split_kv=2)
+    reasons = [engines.analyze_for(s, g, knobs)[1] for s in engines.ENGINE_SPECS]
+    assert all(r is not None for r in reasons)
+    assert any(r and "split_kv=1 only" in r for r in reasons)
+
+
+def test_probe_rejects_prevent_leakage_with_padding_mask():
+    """A padding mask adds a SECOND partially-visible 32-block (the one holding
+    seq_len_kv - 1). Only the causal boundary block is handled today, so the
+    graph must be declined rather than served half-safely."""
+    g = _mk_mxfp8_graph(prevent_leakage=True)
+    facts = _facts(g)
+    padded = dataclasses.replace(facts, padded=True, seq_kv_t=object())
+    reasons = [engines.mismatch(s.capabilities, padded, None) for s in engines.ENGINE_SPECS]
+    assert all(r is not None for r in reasons)
+    assert any(r and "padding masks" in r for r in reasons)

@@ -157,6 +157,14 @@ class Capabilities:
     score_sum_exp: bool = False  # per-row/tile sum-of-exp side output
     dynamic_scale: bool = False
     unfuse_fma: bool = False
+    # EXPERIMENTAL leakage-safe MXFP8 (facts.prevent_leakage). A row sets this
+    # only once its kernels CONSUME V_BF16 and implement the mixed BF16/MXFP8
+    # boundary semantics -- fail-closed, because a row that accepted the flag
+    # without the plumbing would return the ordinary (leaky) MXFP8 result under
+    # a name that promises otherwise. ``prevent_leakage_d_shapes`` narrows it to
+    # the flavors whose kernels carry the path (None = every shape in d_shapes).
+    prevent_leakage: bool = False
+    prevent_leakage_d_shapes: Optional[frozenset] = None
     seq_q_trim: bool = False
     right_band_widening: bool = False
 
@@ -313,6 +321,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if knobs.split_kv is not None and knobs.split_kv > 1:
             if not capabilities.split_kv_supported:
                 return "split_kv > 1 is not wired in this engine's lowering"
+            if facts.prevent_leakage:
+                # Cross-split boundary OWNERSHIP is unsolved: the 32-block a
+                # query's causal boundary falls in can straddle two splits, and
+                # each split's partial would either both add it or neither.
+                return "prevent_leakage=True currently supports split_kv=1 only"
             # Facts x knobs: the split path is structurally dense-only (the
             # per-split LSE is the combine weight; the THD/sink/padded paths
             # do not produce per-split partials). Declined HERE so a split
@@ -409,6 +422,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp output"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
+        (facts.prevent_leakage, capabilities.prevent_leakage, "prevent_leakage (leakage-safe MXFP8)"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
         (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
         (facts.causal, capabilities.causal, "causal mask"),
@@ -446,6 +460,37 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "cu_seq_len_* on dense graphs is not supported yet (kernel CU read mode not plumbed)"
         if (facts.seq_q_t is not None and facts.cu_seq_q_t is not None) or (facts.seq_kv_t is not None and facts.cu_seq_kv_t is not None):
             return "seq_len_* and cu_seq_len_* on the same side is ambiguous (backend precedence is not replicated here)"
+
+    if facts.prevent_leakage and capabilities.prevent_leakage:
+        # Phase 1 envelope. Each of these is a KERNEL property (the boundary
+        # BMM2 lives in the two dense prefill flavors only), so it is declined
+        # here rather than left to fail at compile or, worse, silently run the
+        # leaky path.
+        if capabilities.prevent_leakage_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.prevent_leakage_d_shapes:
+            return (
+                f"prevent_leakage currently supports (D_QK,D_V) of "
+                f"{sorted(capabilities.prevent_leakage_d_shapes)}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+            )
+        if not facts.has_v_bf16:
+            return "prevent_leakage=True requires the original BF16 V tensor via v_bf16"
+        if not (facts.causal or facts.right_band_widening):
+            return "prevent_leakage=True requires a causal right bound (there is no boundary block without one)"
+        if facts.thd:
+            return "prevent_leakage=True does not support THD (ragged) layouts yet"
+        if facts.padded:
+            # A padding mask puts a SECOND partially-visible 32-block on the
+            # row: the one holding seq_len_kv - 1. Its shared E8M0 scale was
+            # computed over columns past the valid length -- whatever the
+            # caller's buffer holds there -- so the block the kernel drops
+            # (the CAUSAL boundary, which sits at or after it) is not the only
+            # one that needs the BF16 treatment. Declined rather than served
+            # half-safely; the fix is to drop min(causal_limit, seq_len_kv - 1)
+            # in the kernel and mirror it in the correction.
+            return "prevent_leakage=True does not support padding masks yet (the padded KV boundary is a second partially-visible block)"
+        if facts.wants_stats:
+            return "prevent_leakage=True is forward-inference-only; generate_stats must be false"
+        if "dense_flex" not in capabilities.layouts and not facts.bshd_layout:
+            return "prevent_leakage=True requires BSHD-physical Q/K/V/O"
 
     if facts.amax_s_t is not None:
         # The FROST FP8 kernels no longer compute Amax_S (dropped: nothing
@@ -592,6 +637,11 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             lse_optional=True,
             thd=True,
             cu_seq_len=True,
+            # EXPERIMENTAL leakage-safe mode: both dense prefill flavors carry
+            # the boundary BF16 BMM2. THD, split_kv > 1 and stats are declined
+            # in mismatch() / the split gate below, not here.
+            prevent_leakage=True,
+            prevent_leakage_d_shapes=frozenset({(128, 128), (192, 128)}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
@@ -889,6 +939,9 @@ def lower_dsl_prefill(
         max_total_seq_len_kv=facts.max_total_seq_len_kv,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
         pertensor_fp8=facts.is_fp8,
+        # EXPERIMENTAL leakage-safe MXFP8: compiles a fused boundary 32-block
+        # BF16 P x original-BF16 V path alongside the MXFP8 mainloop.
+        prevent_leakage=facts.prevent_leakage,
         sched_policy=knobs.sched_policy if knobs is not None else None,
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
@@ -949,6 +1002,7 @@ def lower_dsl_prefill(
         sf_k=facts.sf_k_t,
         sf_v=facts.sf_v_t,
         amax_o=facts.amax_o_t,
+        v_bf16=facts.v_bf16_t,
         descale_q=facts.descale_q_t,
         descale_k=facts.descale_k_t,
         descale_v=facts.descale_v_t,
@@ -1007,6 +1061,9 @@ def lower_dsl_prefill(
         sf_q_buf = resolved.get(id(binding.sf_q)) if binding.sf_q is not None else None
         sf_k_buf = resolved.get(id(binding.sf_k)) if binding.sf_k is not None else None
         sf_v_buf = resolved.get(id(binding.sf_v)) if binding.sf_v is not None else None
+        v_bf16_buf = resolved.get(id(binding.v_bf16)) if binding.v_bf16 is not None else None
+        if not facts.thd and v_bf16_buf is not None:
+            v_bf16_buf = _ir_view(v_bf16_buf, binding.v_bf16)
         amax_o_buf = resolved.get(id(binding.amax_o)) if binding.amax_o is not None else None
         dq_buf = resolved.get(id(binding.descale_q)) if binding.descale_q is not None else None
         dk_buf = resolved.get(id(binding.descale_k)) if binding.descale_k is not None else None
@@ -1053,6 +1110,8 @@ def lower_dsl_prefill(
                 descale_v=dv_buf,
                 scale_o=so_buf,
             )
+        if facts.prevent_leakage:
+            execute_kwargs["v_bf16"] = v_bf16_buf
         if _extra_exec_keys:
             # SM80 feature operand (mismatch admitted it for this row).
             if feature_ops.bias is not None and "bias_tensor" in _extra_exec_keys:

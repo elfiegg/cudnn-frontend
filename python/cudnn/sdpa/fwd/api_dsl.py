@@ -343,6 +343,7 @@ class SdpaFwdDsl(APIBase):
         split_kv: Optional[int] = None,
         softmax_precision: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
+        prevent_leakage: bool = False,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -409,6 +410,12 @@ class SdpaFwdDsl(APIBase):
         self._fp8 = False
         # Per-tensor FP8 (sdpa_fp8) vs block-scale MXFP8 (sdpa_mxfp8); both use FP8 Q/K/V.
         self._pertensor = bool(pertensor_fp8)
+        # EXPERIMENTAL leakage-safe MXFP8 (sdpa_mxfp8(prevent_leakage=True)).
+        # Compiles the mainloop to drop each row's causal-boundary 32-block --
+        # the block whose shared E8M0 scale is what a future V position leaks
+        # through -- and accumulates that block once at BF16 from the original
+        # BF16 V inside the same MXFP8 kernel.
+        self.prevent_leakage = bool(prevent_leakage)
         self._device_cc = None  # (major, minor); set in check_support
         # Tuning-knob choice, already validated against the engine's
         # Capabilities domain by the probe (engines.mismatch). None means the
@@ -1237,6 +1244,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             split_kv=self.split_kv,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
+            # EXPERIMENTAL leakage-safe MXFP8: compiles the causal-boundary
+            # 32-block out of the MXFP8 mainloop. Part of the record that IS
+            # the kernel-module cache key, so a safe and a legacy execution can
+            # never share a compiled specialization.
+            prevent_leakage=self.prevent_leakage,
         )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
@@ -1261,6 +1273,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 kh=self.h_kv,
                 sq=self.s_q_max,
                 skv=self.s_k_max,
+                # The fused boundary path shares the ordinary FP32 O accumulator
+                # and never reads LSE, so a graph with no Stats output keeps the
+                # legacy no-LSE ABI and needs no scratch allocation.
                 has_lse=(self.lse_desc is not None) or self.split_kv > 1,
                 lse_stride=None if self.split_kv > 1 else self._lse_stride,
             )
@@ -1342,7 +1357,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             o_desc_slots = b + (3 if self._fp8 else 1)
             return ws_align((4 * b + 4) * 4) + ws_align(o_desc_slots * 16 * 8) + (0 if self.has_sink else ws_align(qh * 4))
         if self._fp8 and self.split_kv == 1:
-            return 0  # dense FP8/MXFP8: no per-execute scratch (dummies are cached one-time)
+            # Dense FP8/MXFP8 needs no execution scratch.  The safe MXFP8
+            # contribution is fully fused and stages only a 32 x D_v BF16 V
+            # slab in kernel shared memory.
+            return 0
         if self.split_kv > 1:
             # Split-major partial slabs the main kernel writes and the combine
             # pass reduces: O_s [splits*B, S_q, H, d_v] in the O dtype (half —
@@ -1376,6 +1394,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         descale_k: Optional[torch.Tensor] = None,
         descale_v: Optional[torch.Tensor] = None,
         scale_o: Optional[torch.Tensor] = None,
+        v_bf16: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled kernel.
@@ -1468,6 +1487,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 amax_o,
                 current_stream,
                 workspace=workspace,
+                v_bf16=v_bf16,
             )
             return
 
@@ -1917,6 +1937,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         amax_o,
         current_stream=None,
         workspace=None,
+        v_bf16=None,
     ):
         """MXFP8 execute: FP8 Q/K/V + per-32-block E8M0 SF → half/FP8 O.
 
@@ -2006,7 +2027,23 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sf_v_v = self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
 
         # has_lse=False (no Stats output): the store is compiled out; bind None.
+        # The fused safe path does not need an LSE scratch buffer.
         lse = lse_tensor
+
+        V_bf16 = None
+        if self.prevent_leakage:
+            if v_bf16 is None:
+                raise ValueError("prevent_leakage=True requires the original BF16 V tensor (v_bf16)")
+            if v_bf16.dtype != torch.bfloat16:
+                raise ValueError(f"prevent_leakage=True requires v_bf16.dtype == torch.bfloat16; got {v_bf16.dtype}")
+            if v_bf16.device != device:
+                raise ValueError(f"v_bf16 must be on {device}; got {v_bf16.device}")
+            V_bf16 = self._to_bshd(v_bf16)
+            if tuple(V_bf16.shape) != tuple(V.shape):
+                raise ValueError(
+                    "prevent_leakage=True requires v_bf16 to have the same BSHD shape as V; "
+                    f"got {tuple(V_bf16.shape)} versus {tuple(V.shape)}"
+                )
         sinks_t = (
             self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
         )
@@ -2035,6 +2072,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             Q,
             K,
             V,
+            V_bf16,
             O_dst,
             sf_q_v,
             sf_k_v,

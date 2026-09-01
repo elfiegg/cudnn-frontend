@@ -269,3 +269,82 @@ def test_runner_up_sched_plan_builds_and_matches_the_winner():
     j = torch.arange(SKV, device="cuda").view(1, SKV)
     s = s.masked_fill(j > i, float("-inf"))
     torch.testing.assert_close(o_gpu, torch.einsum("bhqk,bhkd->bhqd", torch.softmax(s, dim=-1), v_gpu.float()).half(), atol=5e-2, rtol=3e-2)
+
+
+# ---------------------------------------------------------------------------
+# EXPERIMENTAL leakage-safe MXFP8: the NO-UNSAFE-FALLBACK rail.
+#
+# A graph that asked for a leakage-safe execution must never be served by a
+# plan that ignores v_bf16. Ranking such a plan LOWER is not enough -- an
+# autotuner builds every entry and an explicit index can select any of them,
+# and the result would be the ordinary leaky MXFP8 output under a name that
+# promises the opposite. So they are dropped, and an empty list raises.
+# ---------------------------------------------------------------------------
+
+
+def _backend_entries():
+    """Two native entries plus the untagged delegating one (which falls THROUGH
+    to a native engine_config when the OSS engine declines)."""
+    return [
+        PlanConfig(1, None, mode=cudnn.heur_mode.A, cpp_index=0),
+        PlanConfig(2, None, mode=cudnn.heur_mode.FALLBACK, cpp_index=1),
+        PlanConfig(3, None),  # delegating
+    ]
+
+
+class _FakeGraph:
+    def __init__(self, facts):
+        self._facts = facts
+
+    def _facts_for(self, analyzer):
+        return self._facts
+
+
+def _rank_with(facts, monkeypatch, *, offer=True):
+    """Drive heuristics.rank with a stubbed manifest so the rail is exercised
+    without a GPU or a real engine registry."""
+    from cudnn.engines import heuristics as H
+    from cudnn.engines import manifest as M
+
+    class _Fam:
+        name = "sdpa_fwd"
+
+    monkeypatch.setattr(M, "family_for", lambda g: _Fam())
+    monkeypatch.setattr(M, "resolve_analyzer", lambda f: (lambda g: facts))
+    oss_id = 20502
+
+    def _recommend(kind, f, offered):
+        return [PlanConfig(oss_id, None)] if offer else []
+
+    monkeypatch.setattr(M, "resolve_heuristics", lambda f: _recommend)
+    engines_offered = []
+    if offer:
+
+        class _E:
+            name = "sdpa_fwd_prefill_sm100_mxfp8"
+            engine_id = oss_id
+
+        engines_offered = [_E()]
+    return H.rank(_FakeGraph(facts), engines_offered, _backend_entries(), [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+
+
+@pytest.mark.L0
+def test_rank_drops_every_backend_plan_when_prevent_leakage(monkeypatch):
+    plans = _rank_with(_facts(is_mxfp8=True, prevent_leakage=True, has_v_bf16=True), monkeypatch)
+    assert plans, "the leakage-safe engine's own proposal was dropped too"
+    assert all(c.engine_id == 20502 for c in plans), f"a backend plan survived: {[c.engine_id for c in plans]}"
+
+
+@pytest.mark.L0
+def test_rank_keeps_backend_plans_when_flag_off(monkeypatch):
+    """The rail must not fire for ordinary graphs."""
+    plans = _rank_with(_facts(is_mxfp8=True, prevent_leakage=False), monkeypatch)
+    assert {c.engine_id for c in plans} >= {1, 2, 3}, "flag-off graph lost its backend plans"
+
+
+@pytest.mark.L0
+def test_rank_fails_rather_than_falling_back(monkeypatch):
+    """No safe engine on offer: planning must FAIL. Returning the backend's
+    plans here is the one outcome the flag exists to prevent."""
+    with pytest.raises(Exception, match="no leakage-safe engine"):
+        _rank_with(_facts(is_mxfp8=True, prevent_leakage=True, has_v_bf16=True), monkeypatch, offer=False)

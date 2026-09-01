@@ -124,6 +124,7 @@ def rank(graph, engines: List[BaseEngine], backend_plans: List[PlanConfig], mode
     ``engines`` are this graph's python candidates and ``backend_plans`` the
     backend's own entries, each already tagged with its ``mode``.
     """
+    from .._pygraph import cudnn_graph_not_supported
     from . import manifest
 
     modes = list(modes) if modes else default_modes()
@@ -140,7 +141,28 @@ def rank(graph, engines: List[BaseEngine], backend_plans: List[PlanConfig], mode
         return [_strip(c) for c in backend_plans]
 
     offered = {e.name: e.engine_id for e in engines}
+
+    # NO UNSAFE FALLBACK. A graph that asked for a leakage-safe execution must
+    # never be served by a plan that does not implement it. Backend entries --
+    # native AND the untagged delegating one, which falls THROUGH to a native
+    # engine_config when the OSS engine declines -- advertise no such feature,
+    # so they are dropped rather than ranked below ours: a lower rank is still
+    # a plan an autotuner or an explicit index would select, and the result
+    # would be the ordinary leaky MXFP8 output under a name promising the
+    # opposite. Silently degrading is the one outcome the flag exists to
+    # prevent, so an empty list raises here instead.
+    if getattr(facts, "prevent_leakage", False):
+        backend_plans = []
+
     plans = _assemble(modes, lambda kind: list(recommend(kind, facts, offered)), backend_plans)
+
+    if getattr(facts, "prevent_leakage", False) and not plans:
+        raise cudnn_graph_not_supported(
+            "prevent_leakage=True: no leakage-safe engine can serve this graph, and falling back to a plan "
+            "that ignores v_bf16 would silently return the leaky MXFP8 result. Ensure the FROST engines are "
+            "enabled (CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1) and the graph is inside the supported envelope."
+        )
+
     own = set(offered.values())
     for cfg in plans:
         from .engine_ids import is_python_engine

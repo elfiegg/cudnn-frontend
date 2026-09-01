@@ -688,7 +688,9 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
                     py::object const& max_total_seq_len_q,
                     py::object const& max_total_seq_len_kv,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv) {
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+                    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& v_bf16,
+                    bool const prevent_leakage) {
     auto attributes =
         cudnn_frontend::graph::SDPA_fp8_attributes().set_name(name).set_compute_data_type(compute_data_type);
 
@@ -794,6 +796,23 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
     }
     attributes.set_unfuse_fma(unfuse_fma);
     attributes.set_implementation(implementation);
+
+    // EXPERIMENTAL leakage-safe mode. Binding-level checks mirror the node's
+    // (see SDPANodeBase::validate_prevent_leakage) so a mistake surfaces at the
+    // call rather than at validate(); the node's checks stay authoritative and
+    // also cover direct C++ callers.
+    if (prevent_leakage && !v_bf16) {
+        throw std::runtime_error("prevent_leakage=True requires the original BF16 V tensor via v_bf16.");
+    }
+    if (!prevent_leakage && v_bf16) {
+        throw std::runtime_error(
+            "v_bf16 was supplied without prevent_leakage=True. The tensor would be ignored; set "
+            "prevent_leakage=True or drop v_bf16.");
+    }
+    attributes.set_prevent_leakage(prevent_leakage);
+    if (v_bf16) {
+        attributes.set_v_bf16(v_bf16);
+    }
 
     // Call the MXFP8 6-parameter overload of sdpa_fp8
     // This uses block scale factors (E8M0 + F8_128x4) instead of regular scalar descales
@@ -1419,6 +1438,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("max_total_seq_len_kv", py::none()),
           py::arg_v("cu_seq_len_q", nullptr),
           py::arg_v("cu_seq_len_kv", nullptr),
+          py::arg_v("v_bf16", nullptr),
+          py::arg_v("prevent_leakage", false),
           R"pbdoc(
                 Perform MXFP8 (Microscaling FP8) scaled dot product attention.
 
@@ -1464,6 +1485,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     seq_len_kv (Optional[cudnn_tensor]): The per-batch valid sequence lengths of K/V (int32, shape (B, 1, 1, 1)). Required with use_padding_mask and for THD/ragged inputs. Default is None.
                     cu_seq_len_q (Optional[cudnn_tensor]): Cumulative sequence length of Q, shape (B+1, 1, 1, 1), int32. Mutually exclusive with seq_len_q; pair with a KV-side length tensor and set use_padding_mask=True. Requires cuDNN 9.24 or above. Default is None.
                     cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative sequence length of K/V, shape (B+1, 1, 1, 1), int32. Mutually exclusive with seq_len_kv; pair with a Q-side length tensor and set use_padding_mask=True. Requires cuDNN 9.24 or above. Default is None.
+                    v_bf16 (Optional[cudnn_tensor]): EXPERIMENTAL. The ORIGINAL BF16 V, i.e. the tensor v was quantized FROM -- not a dequantization of v, which cannot recover what quantization lost. Same [B, H_kv, S_kv, D_v] dims, device and head-dim-innermost layout as v. Required when prevent_leakage=True and rejected otherwise. Default is None.
+                    prevent_leakage (Optional[bool]): EXPERIMENTAL, default False. MXFP8 shares one E8M0 scale across 32 S_kv positions, the BMM2 contracting dimension, so changing a FUTURE V position can change the dequantized value of an earlier one in the same block -- letting a causal query observe a key its mask excludes. When True, the 32-position block crossed by each query's causal boundary is computed from BF16 probabilities and the original BF16 V (v_bf16) and zeroed on the MXFP8 path, so it is counted exactly once. Phase 1 serves dense causal MXFP8 forward inference on SM100 with split_kv=1 and (D_qk, D_v) in {(128,128), (192,128)}; anything else fails explicitly rather than falling back to the leaky path.
 
                 Returns:
                     o (cudnn_tensor): The output data.

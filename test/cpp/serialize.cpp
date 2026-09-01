@@ -30,6 +30,30 @@ TEST_CASE("Tensor attributes", "[tensor][serialize]") {
     REQUIRE(tensor_attributes_deserialized == tensor_attributes);
 }
 
+TEST_CASE("SDPA optional flags serialize with backward-compatible defaults", "[sdpa][serialize]") {
+    namespace fe = cudnn_frontend;
+
+    auto attributes = fe::graph::SDPA_attributes().set_prevent_leakage(true).set_unfuse_fma(true);
+    json serialized = attributes;
+
+    REQUIRE(serialized["prevent_leakage"].get<bool>());
+    REQUIRE(serialized["unfuse_fma"].get<bool>());
+
+    auto round_trip      = serialized.get<fe::graph::SDPA_attributes>();
+    json round_trip_json = round_trip;
+    REQUIRE(round_trip_json["prevent_leakage"].get<bool>());
+    REQUIRE(round_trip_json["unfuse_fma"].get<bool>());
+
+    // Graphs serialized before these optional fields existed retain legacy
+    // behavior rather than failing to deserialize.
+    serialized.erase("prevent_leakage");
+    serialized.erase("unfuse_fma");
+    auto legacy      = serialized.get<fe::graph::SDPA_attributes>();
+    json legacy_json = legacy;
+    REQUIRE_FALSE(legacy_json["prevent_leakage"].get<bool>());
+    REQUIRE_FALSE(legacy_json["unfuse_fma"].get<bool>());
+}
+
 TEST_CASE("Tensor attributes alignment", "[tensor][serialize]") {
     namespace fe = cudnn_frontend;
 

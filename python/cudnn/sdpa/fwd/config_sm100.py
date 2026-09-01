@@ -124,6 +124,14 @@ class TemplateParams:
     # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
     # so f16 range is exact where it matters and P quantizes to FP8 either way.
     softmax_f16: bool = False
+    # EXPERIMENTAL leakage-safe MXFP8. MXFP8 shares one E8M0 scale across 32
+    # S_kv positions (the BMM2 contracting dim), so a FUTURE V value can move
+    # the dequantized value of a visible one in the same block. Set: the kernel
+    # removes each row's causal-boundary 32-block only from the MXFP8 P stream
+    # and accumulates that same block once as BF16 P x original BF16 V inside
+    # the kernel. Distinct value == distinct specialization: this
+    # record IS the kernel-module cache key (frost.template_loader).
+    prevent_leakage: bool = False
 
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
@@ -138,10 +146,28 @@ _SPLIT_KV_FLAVORS = frozenset({"d128", "d192", "d256", "d512"})
 _CTA_MMA_FLAVORS = frozenset({"d128", "d192"})
 
 
+_PREVENT_LEAKAGE_FLAVORS = frozenset({"d128", "d192"})
+
+
 def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    if k.prevent_leakage:
+        # BACKSTOP (see the class docstring): every one of these must already
+        # have been declined by a Capabilities row. Tripping one means that row
+        # is dishonest -- and for this flag a dishonest row is not merely
+        # surprising, it silently returns the leaky result.
+        if flavor not in _PREVENT_LEAKAGE_FLAVORS:
+            raise ValueError(f"{flavor}: prevent_leakage is wired in the {sorted(_PREVENT_LEAKAGE_FLAVORS)} flavors only")
+        if not fp8:
+            raise ValueError(f"{flavor}: prevent_leakage is MXFP8-only (there is no block scale to leak through otherwise)")
+        if k.window_right is None:
+            raise ValueError(f"{flavor}: prevent_leakage requires a causal right bound (no boundary block without one)")
+        if k.split_kv != 1:
+            raise ValueError(f"{flavor}: prevent_leakage requires split_kv == 1 (cross-split boundary ownership is unsolved)")
+        if k.thd_varlen:
+            raise ValueError(f"{flavor}: prevent_leakage does not support THD/varlen")
     if fp8 and flavor not in ("d128", "d192"):
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128 and d192")
     if k.softmax_f16 and not fp8:
@@ -691,6 +717,11 @@ class CfgD128:
     SEQ_KV_LENS_PRESENT: int = 0
     SEQ_Q_LENS_PRESENT: int = 0
 
+    # EXPERIMENTAL leakage-safe MXFP8; see TemplateParams.prevent_leakage.
+    # 0 compiles every extra branch away (byte-identical codegen).
+    PREVENT_LEAKAGE: int = 0
+    MX_BLOCK: int = 32  # MXFP8 scale-factor block along S_kv
+
     THD_VARLEN: int = 0
 
     # KV split; 1 = off.  See TemplateParams.split_kv.
@@ -723,7 +754,11 @@ def _d128_smem_bytes(cfg) -> int:
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
     v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE // cfg.CTA_MMA)
-    return qo + k + v
+    # The cga2 safe specialization splits the compact BF16 V operand by output
+    # columns exactly like the ordinary collective BMM2. Two complete phase
+    # sets prevent a next diagonal TMA load from reusing an in-flight MMA source.
+    boundary_v = 2 * cfg.MX_BLOCK * (cfg.TILE_O // cfg.CTA_MMA) * 2 * (cfg.TILE_N // cfg.MX_BLOCK) if cfg.PREVENT_LEAKAGE else 0
+    return qo + k + v + boundary_v
 
 
 def _validate_cfg_d128(cfg: CfgD128) -> None:
@@ -776,6 +811,11 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
     fp8 = params.dtype_qkv <= 1  # E4M3/E5M2 inputs → MXFP8 kernel
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    # The boundary operand follows the ordinary cga2 BMM2 ownership: each CTA
+    # stages its own 32 x 64 BF16 V half and the leader issues one collective
+    # BF16 MMA.  Keep the caller-selected cga width rather than collapsing the
+    # whole kernel to cga1 when leakage prevention is enabled.
+    cta_mma = params.cta_mma
     # FP8/MXFP8 pins the Blackwell K=32 QMMA path (TILE_K_HW=32) and STAGES_KV=4
     # (BPE=1 → 8 KiB/stage, fits 4); f16/bf16 keep 16 / 2.
     tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
@@ -784,14 +824,14 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_O=b_o,
-        CGA_M=params.cta_mma,
-        CTA_MMA=params.cta_mma,
+        CGA_M=cta_mma,
+        CTA_MMA=cta_mma,
         # cga1 has no collective MMA to halve per-CTA K/V, so Q and O must share
         # one slab to stay under the SMEM cap (_validate_cfg_d128 enforces it).
-        QO_ALIAS=1 if params.cta_mma == 1 else 0,
+        QO_ALIAS=1 if cta_mma == 1 else 0,
         Q_SWZ_BYTES=q_swz_bytes(128, b),
         K_SWZ_BYTES=q_swz_bytes(128, b),
-        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
+        V_SWZ_BYTES=v_swz_bytes(128, cta_mma, b),
         O_SWZ_BYTES=o_swz_bytes(128, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw_fp8,
@@ -804,7 +844,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         # cga1 configuration keeps STAGES_KV=2.  mxfp8 additionally stages E8M0
         # scale factors that the SMEM model cannot see, and at STAGES_KV=4 that
         # pushed a cga1 CTA to 237024 B against the 232448 B cap.
-        STAGES_KV=(2 if params.cta_mma == 1 else 4) if fp8 else 2,
+        STAGES_KV=(2 if cta_mma == 1 else 4) if fp8 else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
@@ -814,6 +854,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
+        PREVENT_LEAKAGE=int(params.prevent_leakage),
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
@@ -853,7 +894,9 @@ def _d192_smem_bytes(cfg) -> int:
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
     v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE // cfg.CTA_MMA)
-    return qo + k + v
+    # The safe MXFP8 specialization stages exactly one 32 x D_v BF16 V slab.
+    boundary_v = cfg.MX_BLOCK * cfg.TILE_O * 2 if cfg.PREVENT_LEAKAGE else 0
+    return qo + k + v + boundary_v
 
 
 def _validate_cfg_d192(cfg: CfgD192) -> None:
@@ -907,6 +950,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    cta_mma = 1 if params.prevent_leakage else params.cta_mma
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -916,14 +960,14 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         QO_ALIAS=0 if fp8 else 1,
         Q_SWZ_BYTES=q_swz_bytes(192, b),
         K_SWZ_BYTES=q_swz_bytes(192, b),
-        CGA_M=params.cta_mma,
-        CTA_MMA=params.cta_mma,
-        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
+        CGA_M=cta_mma,
+        CTA_MMA=cta_mma,
+        V_SWZ_BYTES=v_swz_bytes(128, cta_mma, b),
         O_SWZ_BYTES=o_swz_bytes(128, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
-        STAGES_KV=(2 if fp8 else 1) * params.cta_mma,
+        STAGES_KV=(2 if fp8 else 1) * cta_mma,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
@@ -935,6 +979,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
+        PREVENT_LEAKAGE=int(params.prevent_leakage),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
     )

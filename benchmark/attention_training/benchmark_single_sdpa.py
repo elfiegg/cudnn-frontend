@@ -354,6 +354,17 @@ def parse_args():
         type=int,
         help="Sliding window attention size (number of tokens to look back from diagonal)",
     )
+    parser.add_argument(
+        "--prevent_leakage",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL, mxfp8 + cudnn_oss + causal + fwd only. Compute each query's "
+            "causal-boundary 32-block from BF16 probabilities and the ORIGINAL BF16 V "
+            "instead of the MXFP8 V, so a future value inside that block cannot move a "
+            "visible one through their shared E8M0 scale. Requires --skip_ref (the "
+            "reference models the legacy semantics)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -618,6 +629,19 @@ else:
         run_fwd = True
         run_bwd = False
     enable_gqa = num_q_heads != num_kv_heads
+    if args.prevent_leakage:
+        # Fail loudly on every combination outside the phase-1 envelope rather
+        # than quietly measuring the legacy path under a name that promises
+        # otherwise -- a silently-leaky benchmark number is worse than none.
+        if args.data_type != "mxfp8":
+            raise ValueError("--prevent_leakage applies to --data_type mxfp8 only (nothing else has a block scale to leak through)")
+        if args.sdpa_backend != "cudnn_oss":
+            raise ValueError("--prevent_leakage requires --sdpa_backend cudnn_oss (only the FROST kernels implement it)")
+        if args.profile_pass != "fwd":
+            raise ValueError("--prevent_leakage is forward-inference-only; use --profile_pass fwd")
+        if not args.skip_ref:
+            raise ValueError("--prevent_leakage requires --skip_ref (the in-script reference models the legacy semantics)")
+
     if args.data_type == "mxfp8":
         if not is_cudnn_fe:
             raise ValueError("mxfp8 is only supported with the 'cudnn'/'cudnn_oss' backends")
@@ -672,7 +696,12 @@ else:
         randn_dtype = torch.bfloat16 if args.data_type in ("fp8", "mxfp8") else target_dtype
         query = torch.randn(batch_size, q_seqlen, num_q_heads, head_dim_qk, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
         key = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_qk, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
-        value = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype).transpose(1, 2)
+        value_hi = torch.randn(batch_size, kv_seqlen, num_kv_heads, head_dim_vo, dtype=randn_dtype, device=device)
+        value = value_hi.to(target_dtype).transpose(1, 2)
+        # The ORIGINAL (pre-quantization) V, which --prevent_leakage consumes.
+        # Dequantizing `value` instead would only expand what quantization
+        # already destroyed, under a scale that already saw the future.
+        value_bf16 = value_hi.to(torch.bfloat16).transpose(1, 2)
         if args.data_type == "mxfp8":
             output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
         else:
@@ -814,6 +843,8 @@ else:
                 reordering_type=cudnn.tensor_reordering.F8_128x4,
             )
 
+            v_bf16_fwd = graph_fwd.tensor_like(value_bf16) if args.prevent_leakage else None
+
             o_fwd, stats_fwd, amax_o_fwd = graph_fwd.sdpa_mxfp8(
                 q=q_fwd,
                 k=k_fwd,
@@ -825,7 +856,18 @@ else:
                 diagonal_alignment=diagonal_align,
                 diagonal_band_left_bound=left_bound,
                 diagonal_band_right_bound=right_bound,
-                generate_stats=True,
+                # prevent_leakage is forward-inference-only: the diagonal
+                # BF16 P x original-BF16 V contribution is fused into the
+                # MXFP8 kernel, while training Stats remain unsupported.
+                generate_stats=not args.prevent_leakage,
+                **(
+                    # The benchmark holds the PRE-QUANTIZATION bf16 tensor and
+                    # passes that -- dequantizing `value` instead would only
+                    # expand what quantization already destroyed.
+                    dict(v_bf16=v_bf16_fwd, prevent_leakage=True)
+                    if args.prevent_leakage
+                    else {}
+                ),
             )
         else:
             q_fwd = graph_fwd.tensor_like(query)
@@ -850,7 +892,8 @@ else:
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
             elif args.data_type == "mxfp8":
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(convert_to_cudnn_type(output_dtype))
-                stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT)
+                if stats_fwd is not None:  # None under --prevent_leakage (inference-only)
+                    stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT)
             else:
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride())
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
@@ -865,7 +908,8 @@ else:
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
             elif args.data_type == "mxfp8":
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(convert_to_cudnn_type(output_dtype))
-                stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT)
+                if stats_fwd is not None:  # None under --prevent_leakage (inference-only)
+                    stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT)
             else:
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride())
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
@@ -1227,11 +1271,12 @@ else:
                     k_fwd: key,
                     v_fwd: value,
                     o_fwd: output,
-                    stats_fwd: stats,
                     sf_q_fwd: sf_q_gpu,
                     sf_k_fwd: sf_k_gpu,
                     sf_v_fwd: sf_v_gpu,
                     amax_o_fwd: amax_o_gpu,
+                    **({stats_fwd: stats} if stats_fwd is not None else {}),
+                    **({v_bf16_fwd: value_bf16} if v_bf16_fwd is not None else {}),
                 }
                 variant_pack_bwd = {
                     q_bwd: query,
@@ -1311,11 +1356,12 @@ else:
                     k_fwd: key,
                     v_fwd: value,
                     o_fwd: output,
-                    stats_fwd: stats,
                     sf_q_fwd: sf_q_gpu,
                     sf_k_fwd: sf_k_gpu,
                     sf_v_fwd: sf_v_gpu,
                     amax_o_fwd: amax_o_gpu,
+                    **({stats_fwd: stats} if stats_fwd is not None else {}),
+                    **({v_bf16_fwd: value_bf16} if v_bf16_fwd is not None else {}),
                 }
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
             else:
@@ -1668,11 +1714,12 @@ else:
                         k_fwd: key,
                         v_fwd: value,
                         o_fwd: output,
-                        stats_fwd: stats,
                         sf_q_fwd: sf_q_gpu,
                         sf_k_fwd: sf_k_gpu,
                         sf_v_fwd: sf_v_gpu,
                         amax_o_fwd: amax_o_gpu,
+                        **({stats_fwd: stats} if stats_fwd is not None else {}),
+                        **({v_bf16_fwd: value_bf16} if v_bf16_fwd is not None else {}),
                     }
                     variant_pack_bwd = {
                         q_bwd: query,
@@ -1746,11 +1793,12 @@ else:
                         k_fwd: key,
                         v_fwd: value,
                         o_fwd: output,
-                        stats_fwd: stats,
                         sf_q_fwd: sf_q_gpu,
                         sf_k_fwd: sf_k_gpu,
                         sf_v_fwd: sf_v_gpu,
                         amax_o_fwd: amax_o_gpu,
+                        **({stats_fwd: stats} if stats_fwd is not None else {}),
+                        **({v_bf16_fwd: value_bf16} if v_bf16_fwd is not None else {}),
                     }
                 else:
                     variant_pack_fwd = {

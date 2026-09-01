@@ -1165,6 +1165,102 @@ SM90 - Determinism is supported.
 
 SDPA and SDPA backward operations now accept the functions `set_score_mod` and `set_score_mod_bprop`, which allows modification of the attention score matrix. These functions can be used to program a sub-graph of pointwise operations that can subsequently be used to program the score modifier. Note that this function usage is mutually exclusive to the usage of ready made options. Also, note that the graph argument in the score_mod function is not the same as the sdpa graph. So, any tensor to be passed as input to the score-mod sub-graph must first be registered with main graph and subsequently passed as argument to the score_mod function. The SDPA operation also now accepts the function `set_block_mask`, which applies a block mask to the score matrix. The implementation assumes a 128 x 128 block size.
 
+### Leakage-Safe MXFP8 (`prevent_leakage`) — EXPERIMENTAL
+
+MXFP8 quantizes `V` in groups of 32 positions along `S_kv`, which is the
+contracting dimension of the second attention matmul `O = softmax(Q K^T) @ V`.
+One E8M0 scale is shared by the whole group, so changing a value at a **future**
+position can change that scale and therefore the dequantized value of an
+**earlier** one in the same group. A causal query at position 10, whose mask
+forbids it from attending to position 31, can then produce a different output
+when `V[31]` changes. That is the leak: the explicit attention mask is honored,
+but the *quantization* is not causal.
+
+`prevent_leakage=True` (default `False`) makes each query's output depend only
+on positions it may attend, by splitting one query row's accumulation:
+
+```text
+O = sum over FULLY VISIBLE 32-blocks  of  P @ dequant(V_mxfp8)
+  + the ONE causal-boundary 32-block  of  P @ V_bf16
+```
+
+Fully masked future blocks contribute nothing. Only the boundary block — the
+32-block that the query's causal limit falls inside — changes precision, and it
+is counted exactly once.
+
+The mode therefore **requires the original BF16 `V`**, passed as `v_bf16`: the
+tensor that `v` was quantized *from*. Dequantizing `v` is not a substitute — it
+only expands values quantization already destroyed, under a scale that already
+saw the future.
+
+```python
+o, stats, amax_o = graph.sdpa_mxfp8(
+    q=q_mxfp8, k=k_mxfp8, v=v_mxfp8,
+    descale_q=sf_q, descale_k=sf_k, descale_v=sf_v,
+    v_bf16=v_original_bf16,   # the tensor v was quantized FROM
+    prevent_leakage=True,
+    use_causal_mask=True,
+    generate_stats=False,
+)
+```
+
+The C++ equivalent is `SDPA_attributes::set_prevent_leakage(bool)` and
+`set_v_bf16(...)`; the existing `Graph::sdpa_fp8` overloads are unchanged.
+
+#### Supported and unsupported combinations
+
+| Property | Phase 1 |
+|---|---|
+| Operation | Forward MXFP8 SDPA, inference only (`generate_stats=False`) |
+| GPU | SM100 (GB200) |
+| Layout | Dense BSHD |
+| Mask | Causal top-left or bottom-right; right-bound and sliding-window variants allowed |
+| Head shapes | `(D_qk, D_v)` of `(128,128)` and `(192,128)` |
+| Split-KV | `split_kv == 1` only |
+| GQA / MQA | Supported |
+| `Q`/`K`/`V` MX block | Unchanged: 32 values |
+| Padding mask (`seq_len_kv`) | Not supported |
+| THD / ragged | Not supported |
+| Backward / training | Not supported |
+
+A padding mask is declined rather than served half-safely: it puts a *second*
+partially-visible 32-block on the row — the one holding `seq_len_kv - 1`, whose
+shared scale was computed over columns past the valid length — and only the
+causal boundary block is treated today.
+
+Note also what the mode does **not** claim. A sliding window's *left* edge also
+splits a 32-block, but the columns it hides are in the past, so a dependence on
+them is not a causality violation; that block keeps the MXFP8 path.
+
+Anything outside that envelope **fails explicitly**. In particular, a
+`prevent_leakage=True` graph never falls back to a plan that ignores `v_bf16`:
+the planner drops every backend and delegating entry for such a graph and
+raises if no leakage-safe engine remains. Silently returning the ordinary
+(leaky) MXFP8 result is the one outcome the flag exists to prevent.
+
+Omitting both arguments leaves graph building, engine selection, compilation
+and numerical output exactly as before. The flag is part of the graph identity
+and of the kernel cache key, so a leakage-safe execution can never reuse a plan
+compiled for the legacy path.
+
+#### Cost
+
+The boundary work is block-diagonal rather than quadratic (one 32-wide block per
+query row), but in this phase the boundary term runs as a separate pass rather
+than fused into the kernel epilogue. Measured on one GB200 (B=1, forward only,
+top-left causal, 20 warmup / 100 iterations, median):
+
+| Shape | S | legacy MXFP8 | leakage-safe | BF16 SDPA |
+|---|---:|---:|---:|---:|
+| d128 (Hq=64, Hkv=8) | 2048 | 0.109 ms | 0.602 ms | 0.085 ms |
+| d128 (Hq=64, Hkv=8) | 4096 | 0.263 ms | 1.170 ms | 0.241 ms |
+| d192/128 (Hq=Hkv=96) | 2048 | 0.111 ms | 0.984 ms | 0.136 ms |
+| d192/128 (Hq=Hkv=96) | 4096 | 0.292 ms | 1.951 ms | 0.401 ms |
+
+Fusing the boundary product into the kernel's BMM2 epilogue is the obvious
+follow-up; the semantics above would not change.
+
+
 ## cuDNN Version History for SDPA
 
 This section documents features and fixes introduced in each cuDNN version for SDPA operations.
