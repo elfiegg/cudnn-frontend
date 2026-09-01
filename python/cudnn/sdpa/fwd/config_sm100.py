@@ -132,6 +132,11 @@ class TemplateParams:
     # the kernel. Distinct value == distinct specialization: this
     # record IS the kernel-module cache key (frost.template_loader).
     prevent_leakage: bool = False
+    # Experimental two-state causal decomposition.  0 = ordinary attention;
+    # 1 = MXFP8 state excluding the causal-boundary K32 block before softmax;
+    # 2 = BF16-V state containing only that block.  The frontend merges their
+    # normalized (O, LSE) pairs with split_combine_sm100.
+    partial_state_mode: int = 0
 
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
@@ -153,6 +158,20 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    if k.partial_state_mode not in (0, 1, 2):
+        raise ValueError(f"{flavor}: partial_state_mode must be 0 (off), 1 (non-boundary), or 2 (boundary); got {k.partial_state_mode}")
+    if k.partial_state_mode:
+        # This is a semantic state split, not split_kv: both producers scan the
+        # causal range with complementary score masks and a frontend combine
+        # later applies the exact log-sum-exp identity.
+        if flavor != "d128" or not fp8:
+            raise ValueError(f"{flavor}: partial_state_mode is wired only for d128 MXFP8")
+        if k.window_right is None or k.window_left is not None:
+            raise ValueError(f"{flavor}: partial_state_mode requires plain causal attention (right bound, no sliding-window left bound)")
+        if k.split_kv != 1 or k.thd_varlen or k.has_sink:
+            raise ValueError(f"{flavor}: partial_state_mode requires dense split_kv=1 attention without sinks")
+        if bool(k.prevent_leakage) != (k.partial_state_mode == 2):
+            raise ValueError(f"{flavor}: partial_state_mode=2 requires prevent_leakage=True for BF16 V; partial_state_mode=1 requires prevent_leakage=False")
     if k.prevent_leakage:
         # BACKSTOP (see the class docstring): every one of these must already
         # have been declined by a Capabilities row. Tripping one means that row
@@ -720,6 +739,8 @@ class CfgD128:
     # EXPERIMENTAL leakage-safe MXFP8; see TemplateParams.prevent_leakage.
     # 0 compiles every extra branch away (byte-identical codegen).
     PREVENT_LEAKAGE: int = 0
+    # 0 = ordinary/fused-safe, 1 = MXFP8 non-boundary state, 2 = BF16-V boundary state.
+    PARTIAL_STATE_MODE: int = 0
     MX_BLOCK: int = 32  # MXFP8 scale-factor block along S_kv
 
     THD_VARLEN: int = 0
@@ -754,10 +775,16 @@ def _d128_smem_bytes(cfg) -> int:
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
     v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE // cfg.CTA_MMA)
-    # The cga2 safe specialization splits the compact BF16 V operand by output
-    # columns exactly like the ordinary collective BMM2. Two complete phase
-    # sets prevent a next diagonal TMA load from reusing an in-flight MMA source.
-    boundary_v = 2 * cfg.MX_BLOCK * (cfg.TILE_O // cfg.CTA_MMA) * 2 * (cfg.TILE_N // cfg.MX_BLOCK) if cfg.PREVENT_LEAKAGE else 0
+    # State-2 uses a BF16 V sidecar sized for the packed boundary operand.  The
+    # cga2 K128 uses a two-slot ring; cga1 pair packing uses two V64 sidecars,
+    # one for each Q32-pair in its local Q128 tile. Both remain within the SMEM limit.
+    if cfg.PREVENT_LEAKAGE:
+        if cfg.PARTIAL_STATE_MODE == 2:
+            boundary_v = (1 if cfg.CTA_MMA == 1 else 2) * cfg.TILE_N * (cfg.TILE_O // cfg.CTA_MMA) * 2
+        else:
+            boundary_v = 2 * cfg.MX_BLOCK * (cfg.TILE_O // cfg.CTA_MMA) * 2 * (cfg.TILE_N // cfg.MX_BLOCK)
+    else:
+        boundary_v = 0
     return qo + k + v + boundary_v
 
 
@@ -855,6 +882,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
         PREVENT_LEAKAGE=int(params.prevent_leakage),
+        PARTIAL_STATE_MODE=int(params.partial_state_mode),
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),

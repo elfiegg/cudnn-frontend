@@ -344,6 +344,7 @@ class SdpaFwdDsl(APIBase):
         softmax_precision: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
         prevent_leakage: bool = False,
+        partial_state_mode: int = 0,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -416,6 +417,10 @@ class SdpaFwdDsl(APIBase):
         # through -- and accumulates that block once at BF16 from the original
         # BF16 V inside the same MXFP8 kernel.
         self.prevent_leakage = bool(prevent_leakage)
+        # Private experimental producer selector for the frontend two-state
+        # prototype.  Mode 1 emits the MXFP8 non-boundary state; mode 2 emits
+        # the BF16-V boundary state.  The caller combines their (O, LSE).
+        self.partial_state_mode = int(partial_state_mode)
         self._device_cc = None  # (major, minor); set in check_support
         # Tuning-knob choice, already validated against the engine's
         # Capabilities domain by the probe (engines.mismatch). None means the
@@ -1044,6 +1049,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"(D_QK={d_qk}, D_V={d_v})",
         )
         self.flavor = _pick_flavor(d_qk, d_v)
+        if self.partial_state_mode:
+            self._value_error_if(
+                self.partial_state_mode not in (1, 2),
+                f"partial_state_mode must be 1 (non-boundary) or 2 (boundary); got {self.partial_state_mode}",
+            )
+            self._not_implemented_error_if(
+                not self._fp8 or self._pertensor or self.flavor != (128, 128),
+                "partial_state_mode is currently d128 MXFP8-only",
+            )
+            self._value_error_if(
+                not self.is_causal or self.window_size_left is not None or self.window_size_right is not None
+                or self.thd or self.has_sink or self.split_kv != 1,
+                "partial_state_mode requires dense plain causal attention with split_kv=1 and no sink",
+            )
+            self._value_error_if(
+                self.lse_desc is None,
+                "partial_state_mode requires sample_lse because the frontend merges partial (O, LSE) states",
+            )
+            self._value_error_if(
+                self.prevent_leakage != (self.partial_state_mode == 2),
+                "partial_state_mode=2 requires prevent_leakage=True; partial_state_mode=1 requires prevent_leakage=False",
+            )
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
@@ -1051,11 +1078,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         for requested, supported, name in (
             (self.tile_m, 128, "tile_m"),
             (self.tile_n, 128, "tile_n"),
-            (self.cga, 2, "cga"),
         ):
             self._value_error_if(
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
+            )
+        # The cga1 BF16 boundary pair experiment is state-2-only. All established
+        # SDPA paths remain pinned to cga2.
+        _allowed_cga = (1, 2) if self.partial_state_mode == 2 else (2,)
+        self._value_error_if(
+            self.cga is not None and self.cga not in _allowed_cga,
+            f"SM100 DSL SDPA supports cga in {_allowed_cga} for this specialization",
+        )
+        # The cga1 pair-packed boundary prototype maps each Q128 subtile's two Q32-pairs
+        # to V64 spans of its same causal K128 tile, so it is exact only for
+        # ordinary top-left self-attention.
+        if self.partial_state_mode == 2 and self.cga == 1:
+            self._value_error_if(
+                self.causal_bottom_right or int(s_qo) != int(s_kv),
+                "cga=1 boundary pair packing requires top-left self-attention (S_q == S_kv)",
             )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
@@ -1242,6 +1283,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             pack_gqa=self.pack_gqa,
             qh_per_kh=int(self.q_desc.shape[1]) // int(self.k_desc.shape[1]),
             split_kv=self.split_kv,
+            # cga=1 selects the single-CTA tcgen05 path.  This is used by the
+            # experimental BF16 K64-pair boundary-state probe; leave the default
+            # cga2 specialization unchanged when callers do not request it.
+            cta_mma=2 if self.cga is None else self.cga,
             fused_ldtm_stat=fused_ldtm_stat,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
             # EXPERIMENTAL leakage-safe MXFP8: compiles the causal-boundary
@@ -1249,6 +1294,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # the kernel-module cache key, so a safe and a legacy execution can
             # never share a compiled specialization.
             prevent_leakage=self.prevent_leakage,
+            partial_state_mode=self.partial_state_mode,
         )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
