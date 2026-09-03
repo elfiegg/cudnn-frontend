@@ -440,10 +440,12 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
     // EXPERIMENTAL leakage-safe MXFP8 (SDPA_attributes::prevent_leakage).
     //
-    // Phase 1 serves dense causal MXFP8 forward inference only. Everything
-    // outside that envelope must fail HERE with a precise message rather than
-    // fall through to a backend/engine that would ignore V_BF16 and silently
-    // return the leaky result.
+    // Phase 1 serves dense causal MXFP8 forward. Its optional training LSE is
+    // formed from QK before the P@V correction, so it remains valid when the
+    // boundary block uses the original BF16 V. Everything outside that envelope
+    // must fail HERE with a precise message rather than fall through to a
+    // backend/engine that would ignore V_BF16 and silently return the leaky
+    // result.
     error_t
     validate_prevent_leakage() const {
         auto const v_bf16_it  = attributes.inputs.find(input_names::V_BF16);
@@ -467,10 +469,6 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(has_v_bf16 == false,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "prevent_leakage=True requires the original BF16 V tensor via v_bf16.");
-
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.generate_stats.value_or(false),
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "prevent_leakage=True is forward-inference-only; generate_stats must be false.");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             attributes.has_causal_like_masking() == false,
