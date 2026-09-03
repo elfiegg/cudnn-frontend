@@ -487,8 +487,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # half-safely; the fix is to drop min(causal_limit, seq_len_kv - 1)
             # in the kernel and mirror it in the correction.
             return "prevent_leakage=True does not support padding masks yet (the padded KV boundary is a second partially-visible block)"
-        if facts.wants_stats:
-            return "prevent_leakage=True is forward-inference-only; generate_stats must be false"
         if "dense_flex" not in capabilities.layouts and not facts.bshd_layout:
             return "prevent_leakage=True requires BSHD-physical Q/K/V/O"
 
@@ -638,8 +636,9 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             thd=True,
             cu_seq_len=True,
             # EXPERIMENTAL leakage-safe mode: both dense prefill flavors carry
-            # the boundary BF16 BMM2. THD, split_kv > 1 and stats are declined
-            # in mismatch() / the split gate below, not here.
+            # the boundary BF16 BMM2. The ordinary LSE store remains valid
+            # because it is computed from QK before P@V. THD and split_kv > 1
+            # are declined in mismatch() / the split gate below.
             prevent_leakage=True,
             prevent_leakage_d_shapes=frozenset({(128, 128), (192, 128)}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),

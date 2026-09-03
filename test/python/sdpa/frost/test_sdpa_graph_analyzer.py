@@ -1523,8 +1523,8 @@ def test_probe_rejects_prevent_leakage_without_causal():
     assert _eligible(_mk_mxfp8_graph(prevent_leakage=True, causal=False)) == set()
 
 
-def test_probe_rejects_prevent_leakage_with_stats():
-    assert _eligible(_mk_mxfp8_graph(prevent_leakage=True, generate_stats=True)) == set()
+def test_probe_accepts_prevent_leakage_with_stats():
+    assert _eligible(_mk_mxfp8_graph(prevent_leakage=True, generate_stats=True)) == {engines.engine_name(mxfp8=True)}
 
 
 def test_probe_rejects_prevent_leakage_with_split_kv():

@@ -132,6 +132,7 @@ def _build(
     Qb, Kb, Vb = _bshd(Q8), _bshd(K8), _bshd(V8)
     Vbf16 = _bshd(Vf.to(torch.bfloat16))
     Ob = torch.empty(B, S_q, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
+    LSE = torch.empty(B, H_q, S_q, 1, device=dev, dtype=torch.float32) if generate_stats else None
     amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     itype = getattr(cudnn.data_type, _CUDNN_ITYPE[in_key])
@@ -182,6 +183,8 @@ def _build(
 
     o, stats_t, amax_o = g.sdpa_mxfp8(**kw)
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(otype)
+    if generate_stats:
+        stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride(list(LSE.stride())).set_data_type(cudnn.data_type.FLOAT)
     amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
@@ -192,6 +195,8 @@ def _build(
     g.check_support()
     g.build_plans()
     vp.update({o: Ob, amax_o: amax})
+    if generate_stats:
+        vp[stats_t] = LSE
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     extras = dict(
         Qf=Qf,
@@ -204,6 +209,7 @@ def _build(
         dqk=dqk,
         dqv=dqv,
         Vbf16_t=Vbf16,
+        LSE=LSE,
         scale=scale,
         graph=g,
     )
@@ -393,9 +399,15 @@ def test_reject_non_causal():
 
 
 @pytest.mark.L0
-def test_reject_generate_stats():
-    with pytest.raises(Exception):
-        _build(prevent_leakage=True, generate_stats=True)
+def test_generate_stats_matches_qk_lse():
+    """Safe P@V changes only the value path; the saved training LSE is QK-only."""
+    case, ex = _build(prevent_leakage=True, generate_stats=True)
+    case.run()
+    scores = (ex["Q8"].float() * ex["dqq"]) @ (ex["K8"].float() * ex["dqk"]).transpose(-1, -2)
+    scores.mul_(ex["scale"])
+    causal = torch.ones(scores.shape[-2:], device=scores.device, dtype=torch.bool).triu(1)
+    expected = torch.logsumexp(scores.masked_fill(causal, float("-inf")), dim=-1)
+    torch.testing.assert_close(ex["LSE"].squeeze(-1), expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0
