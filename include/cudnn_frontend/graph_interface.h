@@ -398,7 +398,8 @@ class Graph : public ICudnn, public INode {
             sdpa_outputs.Amax_S = attributes.outputs[SDPA_attributes::output_names::Amax_S] =
                 output_tensor(attributes.name + "::Amax_S");
         }
-        if (attributes.mma_core_mode == DataType_t::FP8_E4M3 || attributes.mma_core_mode == DataType_t::FP8_E5M2) {
+        if (!attributes.mxfp8_causal_safe &&
+            (attributes.mma_core_mode == DataType_t::FP8_E4M3 || attributes.mma_core_mode == DataType_t::FP8_E5M2)) {
             sdpa_outputs.Amax_O = attributes.outputs[SDPA_attributes::output_names::Amax_O] =
                 output_tensor(attributes.name + "::Amax_O");
         }

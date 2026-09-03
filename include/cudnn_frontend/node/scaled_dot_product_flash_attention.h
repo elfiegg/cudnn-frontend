@@ -196,6 +196,11 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                 descale_q->get_reordering_type() == TensorReordering_t::F8_128x4);
     }
 
+    bool
+    is_mxfp8_causal_safe() const {
+        return is_mxfp8_scaling() && attributes.mxfp8_causal_safe;
+    }
+
     // Helper function to infer KV sequence length
     // Note that it cannot be run as part of infer_properties_node as
     // this is being used in pre_validate_node
@@ -318,6 +323,29 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
                                            attributes.inputs.find(input_names::SINK_TOKEN) != attributes.inputs.end(),
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "SDPA with sink_token is not supported before 9.13.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.mxfp8_causal_safe && !is_mxfp8_scaling(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "mxfp8_causal_safe requires MXFP8 Q/K/V scale factors");
+        if (is_mxfp8_causal_safe()) {
+            auto const v_bf16_it = attributes.inputs.find(input_names::V_BF16);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!attributes.has_causal_like_masking(),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "mxfp8_causal_safe requires a causal right bound");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(v_bf16_it == attributes.inputs.end() || v_bf16_it->second == nullptr,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "mxfp8_causal_safe requires the original BF16 V tensor");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(v_bf16_it->second->get_data_type() != DataType_t::BFLOAT16,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "mxfp8_causal_safe requires V_BF16 to have BFLOAT16 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(v_bf16_it->second->get_dim() != attributes.inputs.at(input_names::V)->get_dim() ||
+                                               v_bf16_it->second->get_stride() != attributes.inputs.at(input_names::V)->get_stride(),
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "mxfp8_causal_safe requires V_BF16 to match the MXFP8 V layout");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.outputs.at(output_names::O)->get_data_type() != DataType_t::BFLOAT16,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "mxfp8_causal_safe requires BFLOAT16 O");
+        }
 
         // Validate MXFP8 scale factors if present
         if (is_mxfp8_scaling()) {
@@ -694,6 +722,7 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         // Check if using MXFP8 (microscaling FP8) with block-wise scale factors
         // Need to check this early because MXFP8 dequantization must happen before K transpose
         bool const use_mxfp8 = is_mxfp8_scaling();
+        bool const use_mxfp8_causal_safe = is_mxfp8_causal_safe();
 
         std::shared_ptr<Tensor_attributes> k_cache;
         if (!is_paged_k()) {
@@ -1046,7 +1075,8 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
 
         // Lower attributes to bmm2 attributes
         // Requirement by cudnn backend to take in bmm2 aType as i/o type.
-        last_output->set_data_type(attributes.inputs[input_names::Q]->get_data_type());
+        last_output->set_data_type(use_mxfp8_causal_safe ? DataType_t::BFLOAT16
+                                                          : attributes.inputs[input_names::Q]->get_data_type());
 
         auto const& seq_len_q  = attributes.inputs[input_names::SEQ_LEN_Q];
         auto const& seq_len_kv = attributes.inputs[input_names::SEQ_LEN_KV];
@@ -1055,7 +1085,7 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
 
         std::shared_ptr<Tensor_attributes> v_cache;
 
-        if (!is_paged_v()) {
+        if (!is_paged_v() || use_mxfp8_causal_safe) {
             v_cache = attributes.inputs[input_names::V];
         } else {
             auto paged_cache_load_attributes_v = PagedCacheLoad_attributes().set_name("paged_v_cache_operation");
@@ -1072,7 +1102,12 @@ class CompositeSDPANode : public SDPANodeBase<CompositeSDPANode> {
         }
 
         //// S * V
-        if (attributes.mma_core_mode == DataType_t::HALF) {
+        if (use_mxfp8_causal_safe) {
+            auto bmm2_attributes = Matmul_attributes().set_name("bmm2_bf16_causal_safe")
+                                       .set_m_override(seq_len_q)
+                                       .set_k_override(seq_len_kv);
+            matmul(last_output, attributes.inputs[input_names::V_BF16], bmm2_attributes, O);
+        } else if (attributes.mma_core_mode == DataType_t::HALF) {
             auto bmm2_attributes =
                 Matmul_attributes().set_name("bmm2").set_m_override(seq_len_q).set_k_override(seq_len_kv);
             // Special non-functional-style call. Needed because output already created and provided to user.

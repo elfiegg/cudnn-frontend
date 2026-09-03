@@ -387,6 +387,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::input_names,
                                  {SDPA_attributes::input_names::Scale_S, "Scale_S"},
                                  {SDPA_attributes::input_names::Scale_O, "Scale_O"},
                                  {SDPA_attributes::input_names::SINK_TOKEN, "SINK_TOKEN"},
+                                 {SDPA_attributes::input_names::V_BF16, "V_BF16"},
                              })
 
 NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::output_names,
@@ -475,6 +476,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_backward_attributes::input_names,
                                  {SDPA_fp8_backward_attributes::input_names::Scale_S, "Scale_S"},
                                  {SDPA_fp8_backward_attributes::input_names::Scale_dP, "Scale_dP"},
                                  {SDPA_fp8_backward_attributes::input_names::SINK_TOKEN, "SINK_TOKEN"},
+                                 {SDPA_fp8_backward_attributes::input_names::K_BF16, "K_BF16"},
+                                 {SDPA_fp8_backward_attributes::input_names::V_BF16, "V_BF16"},
                              })
 
 NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_backward_attributes::output_names,

@@ -2020,6 +2020,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     AttentionImplementation_t implementation = AttentionImplementation_t::AUTO;
 
     bool unfuse_fma = false;  // For SM100: use __fmul_rn + __fadd_rn instead of ffma2 in softmax
+    bool mxfp8_causal_safe = false;
 
     bool
     has_bias() const {
@@ -2067,6 +2068,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         Scale_S,
         Scale_O,
         SINK_TOKEN,
+        V_BF16,
     };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { O, Stats, Max, Sum_exp, RNG_DUMP, Amax_S, Amax_O };
@@ -2099,11 +2101,22 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
                                    left_bound,
                                    right_bound,
                                    diagonal_alignment,
-                                   implementation)
+                                   implementation,
+                                   mxfp8_causal_safe)
 
     SDPA_attributes&
     set_generate_stats(bool const value) {
         generate_stats = value;
+        return *this;
+    }
+
+    // MXFP8 causal-safe hybrid: Q/K remain MXFP8 while P@V consumes this
+    // original BF16 V tensor. The ordinary V argument remains the MXFP8 V
+    // tensor so the public FP8 graph contract stays backward compatible.
+    SDPA_attributes&
+    set_mxfp8_causal_safe(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::V_BF16] = std::move(value);
+        mxfp8_causal_safe = true;
         return *this;
     }
 
@@ -2606,6 +2619,7 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
 
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
+    bool mxfp8_causal_safe = false;
 
    public:
     enum class input_names {
@@ -2645,6 +2659,8 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
         Scale_S,
         Scale_dP,
         SINK_TOKEN,
+        K_BF16,
+        V_BF16,
     };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
 
@@ -2662,7 +2678,19 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
                                    right_bound,
                                    diagonal_alignment,
                                    attn_scale_value,
-                                   is_deterministic_algorithm)
+                                   is_deterministic_algorithm,
+                                   mxfp8_causal_safe)
+
+    // MXFP8 causal-safe hybrid: retain original BF16 K and V for the
+    // sequence-axis contractions dS@K and dO@V.T.
+    SDPA_fp8_backward_attributes&
+    set_mxfp8_causal_safe(std::shared_ptr<Tensor_attributes> k_bf16,
+                          std::shared_ptr<Tensor_attributes> v_bf16) {
+        inputs[SDPA_fp8_backward_attributes::input_names::K_BF16] = std::move(k_bf16);
+        inputs[SDPA_fp8_backward_attributes::input_names::V_BF16] = std::move(v_bf16);
+        mxfp8_causal_safe = true;
+        return *this;
+    }
 
     SDPA_fp8_backward_attributes&
     set_attn_scale(std::shared_ptr<Tensor_attributes> value) {

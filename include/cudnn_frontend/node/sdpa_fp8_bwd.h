@@ -79,6 +79,11 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                 descale_q->get_reordering_type() == TensorReordering_t::F8_128x4);
     }
 
+    bool
+    is_mxfp8_causal_safe() const {
+        return is_mxfp8_scaling() && attributes.mxfp8_causal_safe;
+    }
+
     error_t
     pre_validate_node() const override final {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Validating SDPAFP8BackwardNode " << attributes.name);
@@ -312,6 +317,33 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             "sdpa fp8 backward with HALF/BFLOAT16 output is only supported on Blackwell architecture "
             "with cuDNN version 9.13.0 and newer.");
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.mxfp8_causal_safe && !is_mxfp8_scaling(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "mxfp8_causal_safe requires MXFP8 Q/K/V scale factors");
+        if (is_mxfp8_causal_safe()) {
+            auto const k_bf16_it = attributes.inputs.find(input_names::K_BF16);
+            auto const v_bf16_it = attributes.inputs.find(input_names::V_BF16);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!attributes.has_causal_like_masking(),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "mxfp8_causal_safe requires a causal right bound");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(k_bf16_it == attributes.inputs.end() || k_bf16_it->second == nullptr ||
+                                               v_bf16_it == attributes.inputs.end() || v_bf16_it->second == nullptr,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "mxfp8_causal_safe requires original BF16 K and V tensors");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(k_bf16_it->second->get_data_type() != DataType_t::BFLOAT16 ||
+                                               v_bf16_it->second->get_data_type() != DataType_t::BFLOAT16,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "mxfp8_causal_safe requires K_BF16 and V_BF16 to have BFLOAT16 data type");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(k_bf16_it->second->get_dim() != attributes.inputs.at(input_names::K)->get_dim() ||
+                                               v_bf16_it->second->get_dim() != attributes.inputs.at(input_names::V)->get_dim(),
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "mxfp8_causal_safe requires K_BF16/V_BF16 to match the MXFP8 K/V dimensions");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(k_bf16_it->second->get_stride() != attributes.inputs.at(input_names::K)->get_stride() ||
+                                               v_bf16_it->second->get_stride() != attributes.inputs.at(input_names::V)->get_stride(),
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "mxfp8_causal_safe requires K_BF16/V_BF16 to match the MXFP8 K/V layout");
+        }
+
         // Validate MXFP8 scale factors if present
         if (is_mxfp8_scaling()) {
             // MXFP8 requires cuDNN 9.21.0 or later
@@ -522,6 +554,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         auto d_v          = v_dim[3];
 
         bool const use_mxfp8 = is_mxfp8_scaling();
+        bool const use_mxfp8_causal_safe = is_mxfp8_causal_safe();
         std::shared_ptr<Tensor_attributes> eff_Q, eff_K, eff_V, eff_dO;
 
         // cuDNN frontend API attention requires Q, K, V where
@@ -580,15 +613,22 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             sf_v->set_dim(sf_v_dim);
             sf_v->set_stride(sf_v_stride);
 
-            auto dequant_v_dv_attrs = Block_scale_dequantize_attributes()
-                                          .set_name("DQ_V_dv")
-                                          .set_block_size({1, 32});
-            auto v_dv_dequant = std::make_shared<Tensor_attributes>();
-            v_dv_dequant->set_is_virtual(true);
-            v_dv_dequant->set_dim(vt_dim);
-            v_dv_dequant->set_stride(vt_stride);
-            block_scale_dequantize(attributes.inputs[input_names::V], sf_v, dequant_v_dv_attrs, v_dv_dequant);
-            eff_V = v_dv_dequant;
+            if (use_mxfp8_causal_safe) {
+                auto v_bf16 = reshape(attributes.inputs[input_names::V_BF16],
+                                      Reshape_attributes().set_name("reshape_V_BF16"));
+                v_bf16->set_dim(vt_dim).set_stride(vt_stride);
+                eff_V = v_bf16;
+            } else {
+                auto dequant_v_dv_attrs = Block_scale_dequantize_attributes()
+                                              .set_name("DQ_V_dv")
+                                              .set_block_size({1, 32});
+                auto v_dv_dequant = std::make_shared<Tensor_attributes>();
+                v_dv_dequant->set_is_virtual(true);
+                v_dv_dequant->set_dim(vt_dim);
+                v_dv_dequant->set_stride(vt_stride);
+                block_scale_dequantize(attributes.inputs[input_names::V], sf_v, dequant_v_dv_attrs, v_dv_dequant);
+                eff_V = v_dv_dequant;
+            }
 
             // Q for BMM1 (Q@K.T): Dequantize Q with Descale_Q
             auto dequant_q_dqk_attrs = Block_scale_dequantize_attributes()
@@ -612,11 +652,13 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
             dO_dv_dequant->set_is_virtual(true);
             dO_dv_dequant->set_dim(attributes.inputs[input_names::dO]->get_dim());
             dO_dv_dequant->set_stride(attributes.inputs[input_names::dO]->get_stride());
-            block_scale_dequantize(attributes.inputs[input_names::dO],
-                                   attributes.inputs[input_names::Descale_dO],
-                                   dequant_dO_dv_attrs,
-                                   dO_dv_dequant);
-            eff_dO = dO_dv_dequant;
+            if (!use_mxfp8_causal_safe) {
+                block_scale_dequantize(attributes.inputs[input_names::dO],
+                                       attributes.inputs[input_names::Descale_dO],
+                                       dequant_dO_dv_attrs,
+                                       dO_dv_dequant);
+            }
+            eff_dO = use_mxfp8_causal_safe ? attributes.inputs[input_names::dO_f16] : dO_dv_dequant;
 
             // Note: O and dO for the dO*O computation are used as raw f16 inputs (no MXFP8 dequant).
             // The separate dequantizations for dO_seq, K_seq, Q_seq are done inline at their usage sites.
@@ -1016,7 +1058,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
         }
 
         //// dS @ K -> dQ
-        if (use_mxfp8) {
+        if (use_mxfp8 && !use_mxfp8_causal_safe) {
             // MXFP8: Dequantize K_T with Descale_K_T (seq-dimension scaling) for dS@K -> dQ
             auto dequant_K_seq_attrs = Block_scale_dequantize_attributes()
                                            .set_name("DQ_K_seq")
@@ -1046,7 +1088,7 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                     Reduction_attributes().set_name("amax_dQ").set_mode(ReductionMode_t::AMAX);
                 reduction(attributes.outputs[output_names::dQ], amax_dq_attributes, amax_dq);
             }
-        } else {
+        } else if (!use_mxfp8) {
             auto const& kt_dim    = attributes.inputs[input_names::K]->get_dim();
             auto const& kt_stride = attributes.inputs[input_names::K]->get_stride();
 
@@ -1065,6 +1107,25 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                        bmm_dP_K_attributes,
                        attributes.outputs[output_names::dQ],
                        attributes.outputs[output_names::Amax_dQ]);
+        } else {
+            auto const& k_bf16_dim    = attributes.inputs[input_names::K_BF16]->get_dim();
+            auto const& k_bf16_stride = attributes.inputs[input_names::K_BF16]->get_stride();
+            auto k_bf16 = reshape(attributes.inputs[input_names::K_BF16],
+                                  Reshape_attributes().set_name("reshape_K_BF16"));
+            k_bf16->set_dim({k_bf16_dim[0], k_bf16_dim[1], k_bf16_dim[3], k_bf16_dim[2]})
+                .set_stride({k_bf16_stride[0], k_bf16_stride[1], k_bf16_stride[3], k_bf16_stride[2]});
+
+            auto bmm_dS_K_attributes = Matmul_attributes().set_name("bmm_dS_K_BF16_causal_safe")
+                                           .set_m_override(attributes.inputs[input_names::SEQ_LEN_Q])
+                                           .set_k_override(attributes.inputs[input_names::SEQ_LEN_KV]);
+            matmul(dP, k_bf16, bmm_dS_K_attributes, attributes.outputs[output_names::dQ]);
+
+            auto const& amax_dq = attributes.outputs.at(output_names::Amax_dQ);
+            if (amax_dq != nullptr) {
+                auto amax_dq_attributes =
+                    Reduction_attributes().set_name("amax_dQ").set_mode(ReductionMode_t::AMAX);
+                reduction(attributes.outputs[output_names::dQ], amax_dq_attributes, amax_dq);
+            }
         }
 
         //// dS.T * Q (transpose dS -> dS_reshape)

@@ -1162,3 +1162,18 @@ TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
     }
 #endif  // CUDNN_VERSION >= 90800
 }
+
+TEST_CASE("MXFP8 causal-safe SDPA attribute serialization", "[graph][serialize]") {
+    namespace fe = cudnn_frontend;
+
+    auto k_bf16 = std::make_shared<fe::graph::Tensor_attributes>();
+    auto v_bf16 = std::make_shared<fe::graph::Tensor_attributes>();
+    auto forward = fe::graph::SDPA_attributes().set_mxfp8_causal_safe(v_bf16);
+    json forward_json = forward;
+    REQUIRE(forward_json["mxfp8_causal_safe"] == true);
+    REQUIRE(forward_json["inputs"].contains("V_BF16"));
+
+    auto backward = fe::graph::SDPA_fp8_backward_attributes().set_mxfp8_causal_safe(k_bf16, v_bf16);
+    json backward_json = backward;
+    REQUIRE(backward_json["mxfp8_causal_safe"] == true);
+    REQUIRE(backward_json["inputs"].contains("K_BF16"));
